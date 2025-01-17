@@ -1251,6 +1251,725 @@ fn main() {
 # Part 2:Event Queues and Green Threads 第二部分：事件队列和绿色线程
 
 
+在这一部分，我们将展示两个示例。第一个示例演示了如何使用 epoll 创建一个事件队列。我们将设计一个与 mio 所使用的 API 非常相似的 API，以便我们能够掌握 mio 和 epoll 的基础知识。第二个示例展示了如何使用纤程/绿色线程，类似于 Go 所采用的方法。这种方法是 Rust 使用 futures 和 async/await 进行异步编程的流行替代方案之一。Rust 在 1.0 版本之前也使用过绿色线程，因此它是 Rust 异步历史的一部分。在整个探索过程中，我们将深入探讨一些基本的编程概念，如指令集架构（ISA）、应用二进制接口（ABI）、调用约定、栈，并简要涉及汇编编程。这一部分包括以下章节：
+
+第 4 章：创建你自己的事件队列
+在本章中，我们将使用 epoll 创建一个简单的事件队列。我们将从 mio（https://github.com/tokio-rs/mio）中汲取灵感，这是一个用 Rust 编写的低级 I/O 库，支撑了 Rust 异步生态系统的很大一部分。从 mio 中汲取灵感还有一个额外的好处，那就是如果你希望探索一个真正的生产级库是如何工作的，可以更容易地深入研究它们的代码库。
+
+在本章结束时，你应该能够理解以下内容：
+
+阻塞和非阻塞 I/O 的区别
+如何使用 epoll 创建自己的事件队列
+跨平台事件队列库（如 mio）的源代码
+如果我们希望程序或库能够在不同平台上运行，为什么需要在 epoll、kqueue 和 IOCP 之上构建一个抽象层
+我们将本章分为以下几个部分：
+
+epoll 的设计与介绍
+ffi 模块
+Poll 模块
+主程序
+技术要求
+本章重点介绍 epoll，它是特定于 Linux 的。不幸的是，epoll 不是可移植操作系统接口（POSIX）标准的一部分，因此这个示例需要你在 Linux 上运行，无法在 macOS、BSD 或 Windows 操作系统上运行。
+
+如果你已经在运行 Linux 的机器上，那么你已经准备好了，可以直接运行示例，无需其他步骤。
+
+如果你在 Windows 上，我建议你设置 WSL（https://learn.microsoft.com/en-us/windows/wsl/install），如果还没有的话，并在 WSL 上运行的 Linux 操作系统中安装 Rust。
+
+如果你使用的是 Mac，你可以创建一个运行 Linux 的虚拟机（VM），例如使用基于 QEMU 的 UTM 应用程序（https://mac.getutm.app/）或任何其他用于管理 Mac 上虚拟机的解决方案。
+
+
+最后一个选项是租用一台 Linux 服务器（甚至有一些提供商提供免费层），安装 Rust，然后在控制台中使用诸如 Vim 或 Emacs 的编辑器，或者通过 SSH 使用 VS Code 在远程机器上进行开发（https://code.visualstudio.com/docs/remote/ssh）。我个人对 Linode 的服务（https://www.linode.com/）有很好的体验，但市场上还有很多其他选择。
+
+理论上，可以在 Rust Playground 上运行这些示例，但由于我们需要一个延迟服务器，因此必须使用一个接受普通 HTTP 请求（而不是 HTTPS）的远程延迟服务器服务，并修改代码，使所有模块都在一个文件中。这在紧急情况下是可行的，但并不推荐。
+
+延迟服务器
+这个示例依赖于对一个服务器的调用，该服务器会延迟响应一段可配置的时间。在代码库的根文件夹中，有一个名为 delayserver 的项目。
+
+你可以通过在一个单独的控制台窗口中进入该文件夹并输入 cargo run 来设置服务器。只需让服务器在一个单独的、打开的终端窗口中运行，因为我们将在示例中使用它。
+
+delayserver 程序是跨平台的，因此无需任何修改即可在 Rust 支持的所有平台上运行。如果你在 Windows 上运行 WSL，我建议也在 WSL 中运行 delayserver 程序。根据你的设置，你可能可以在 Windows 控制台中运行服务器，并在 WSL 中运行示例时仍然能够访问它。但请注意，它可能无法开箱即用。
+
+服务器默认监听 8080 端口，示例中假设使用此端口。你可以在启动服务器之前在 delayserver 代码中更改监听端口，但请记住在示例代码中进行相同的修改。
+
+delayserver 的实际代码不到 30 行，因此如果你想了解服务器的功能，浏览代码只需几分钟。
+
+设计与 epoll 介绍
+好了，本章将围绕代码库中 ch04/a-epoll 下的一个主要示例展开。我们将从设计示例开始。
+
+正如我在本章开头提到的，我们将从 mio 中汲取灵感。这有一个很大的优点和一个缺点。优点是我们可以轻松了解 mio 的设计方式，如果你想学习比本示例中更多的内容，可以更容易地深入研究其代码库。缺点是我们引入了一个过于厚重的抽象层，覆盖了 epoll，包括一些非常特定于 mio 的设计决策。
+
+我认为优点大于缺点，原因很简单：如果你想实现一个生产质量的事件循环，你可能会想看看现有的实现，如果你想深入了解 Rust 异步编程的构建块，也是如此。在 Rust 中，mio 是支撑大部分异步生态系统的重要库之一，因此对它有一点熟悉是一个额外的收获。
+
+需要注意的是，mio 是一个跨平台库，它在 epoll、kqueue 和 IOCP（通过 Wepoll，如我们在第 3 章中所述）之上创建了一个抽象层。不仅如此，mio 还支持 iOS 和 Android，未来可能还会支持其他平台。因此，如果你将其与仅支持一个平台所能实现的功能进行比较，那么为这么多不同系统统一 API 必然会带来一些妥协。
+
+MIO
+mio 自称为“一个快速、低级的 Rust I/O 库，专注于非阻塞 API 和事件通知，旨在以尽可能少的开销在操作系统抽象之上构建高性能 I/O 应用程序。”
+
+mio 驱动了 Tokio 中的事件队列，Tokio 是 Rust 中最受欢迎和广泛使用的异步运行时之一。这意味着 mio 正在为诸如 Actix Web（https://actix.rs/）、Warp（https://github.com/seanmonstar/warp）和 Rocket（https://rocket.rs/）等流行框架驱动 I/O。
+
+在本示例中，我们将以 mio 0.8.8 版本作为设计灵感。API 在过去已经发生了变化，未来可能还会发生变化，但我们在这里介绍的 API 部分自 2019 年以来一直保持稳定，因此在不久的将来不太可能发生重大变化。
+
+与所有跨平台抽象一样，通常有必要选择最小公分母。一些选择将限制一个或多个平台上的灵活性和效率，以追求一个适用于所有平台的统一 API。我们将在本章中讨论其中的一些选择。
+
+在我们继续之前，让我们创建一个空白项目并为其命名。我们将它称为 a-epoll，但你当然需要用你选择的名称替换它。
+
+进入文件夹并输入 cargo init 命令。
+
+在本示例中，我们将项目分为几个模块，并将代码拆分为以下文件：
+
+src
+  |-- ffi.rs
+  |-- main.rs
+  |-- poll.rs
+它们的描述如下：
+
+ffi.rs：此模块将包含与我们需要与主机操作系统通信的系统调用相关的代码。
+main.rs：这是示例程序本身。
+poll.rs：此模块包含主要抽象，即 epoll 之上的一个薄层。
+接下来，在 src 文件夹中创建上述四个文件。在 main.rs 中，我们还需要声明这些模块。
+
+
+a-epoll/src/main.rs
+mod ffi;
+mod poll;
+现在我们已经设置好了项目，我们可以开始讨论如何设计我们将要使用的 API。主要的抽象在 poll.rs 中，所以请打开该文件。
+
+让我们从定义我们需要的结构和函数开始。当我们把它们放在面前时，讨论起来会更容易：
+
+a-epoll/src/poll.rs
+use std::{io::{self, Result}, net::TcpStream, os::fd::AsRawFd};
+use crate::ffi;
+
+type Events = Vec<ffi::Event>;
+
+pub struct Poll {
+  registry: Registry,
+}
+
+impl Poll {
+  pub fn new() -> Result<Self> {
+    todo!()
+  }
+
+  pub fn registry(&self) -> &Registry {
+    &self.registry
+  }
+
+  pub fn poll(&mut self, events: &mut Events, timeout: Option<i32>) -> Result<()> {
+    todo!()
+  }
+}
+
+pub struct Registry {
+  raw_fd: i32,
+}
+
+impl Registry {
+  pub fn register(&self, source: &TcpStream, token: usize, interests: i32) -> Result<()> {
+    todo!()
+  }
+}
+
+impl Drop for Registry {
+  fn drop(&mut self) {
+    todo!()
+  }
+}
+我们现在已经将所有实现替换为 todo!()。这个宏将允许我们编译程序，尽管我们还没有实现函数体。如果我们的执行过程到达 todo!()，它将会 panic。
+
+你首先会注意到的是，除了标准库中的一些类型外，我们还将 ffi 模块引入作用域。
+
+我们还将使用 std::io::Result 类型作为我们自己的 Result 类型。这很方便，因为大多数错误将来自于我们对操作系统的调用，而操作系统错误可以映射到 io::Error 类型。
+
+epoll 有两个主要的抽象。一个是一个名为 Poll 的结构体，另一个是 Registry。这些函数的名称和功能与 mio 中的相同。命名这样的抽象出人意料地困难，这两个结构体本可以有其他名称，但让我们依赖这样一个事实：有人在我们之前已经花时间思考过这个问题，并决定在我们的示例中使用这些名称。
+
+Poll 是一个表示事件队列本身的结构体。它有几个方法：
+
+new：创建一个新的事件队列。
+registry：返回一个注册表的引用，我们可以用它来注册我们感兴趣的事件通知。
+poll：阻塞调用它的线程，直到有事件准备好或超时，以先发生者为准。
+Registry 是另一个重要的部分。虽然 Poll 表示事件队列，但 Registry 是一个句柄，允许我们注册对新事件的兴趣。
+
+Registry 只有一个方法：register。同样，我们模仿了 mio 使用的 API（https://docs.rs/mio/0.8.8/mio/struct.Registry.html），而不是接受一个预定义的方法列表来注册不同的兴趣，我们接受一个 interests 参数，它将指示我们希望事件队列跟踪哪些类型的事件。
+
+还有一点需要注意的是，我们不会为所有源使用泛型类型。我们只会为 TcpStream 实现这一点，尽管我们可以用事件队列跟踪许多东西。特别是当我们希望使其跨平台时，根据你想要支持的平台，我们可能希望跟踪许多类型的事件源。
+
+mio 通过让 Registry::register 接受一个实现了 mio 定义的 Source trait 的对象来解决这个问题。只要你为源实现了这个 trait，你就可以使用事件队列来跟踪它上面的事件。
+
+在下面的伪代码中，你将了解我们计划如何使用这个 API：
+
+
+let queue = Poll::new().unwrap();
+let id = 1;
+// 注册对 TcpStream 上的事件的兴趣
+queue.registry().register(&stream, id, ...).unwrap();
+let mut events = Vec::with_capacity(1);
+// 这将阻塞当前线程
+queue.poll(&mut events, None).unwrap();
+// ...数据在其中一个被跟踪的流上准备好了
+你可能会想知道为什么我们需要 Registry 结构体。要回答这个问题，我们需要记住 mio 是对 epoll、kqueue 和 IOCP 的抽象。它通过让 Registry 包装一个 Selector 对象来实现这一点。Selector 对象是条件编译的，因此每个平台都有自己的 Selector 实现，对应于相关的系统调用，以使 IOCP、kqueue 和 epoll 做同样的事情。
+
+Registry 实现了一个重要的方法，我们不会在我们的示例中实现，这个方法叫做 try_clone。我们不实现它的原因是我们不需要它来理解像这样的事件循环是如何工作的，而且我们希望保持示例简单易懂。然而，这个方法对于理解为什么注册事件和队列本身的责任是分开的很重要。
+
+重要说明
+通过将注册兴趣的责任转移到像这样的单独结构体，用户可以调用 Registry::try_clone 来获取一个拥有的 Registry 实例。这个实例可以传递给其他线程，或者通过 Arc<Registry> 共享，允许多个线程向同一个 Poll 实例注册兴趣，即使 Poll 在等待新事件发生时阻塞了另一个线程。
+
+Poll::poll 需要独占访问权限，因为它接受 &mut self，所以当我们在 Poll::poll 中等待事件时，如果我们依赖使用 Poll 来注册兴趣，那么同时从另一个线程注册兴趣是不可能的，因为这会被 Rust 的类型系统阻止。
+
+这也使得在同一个实例上通过调用 Poll::poll 来让多个线程等待事件变得几乎不可能，因为这将需要同步，而这本质上会使每次调用都变成顺序的。
+
+这种设计允许用户从潜在的多个线程与队列交互，通过注册兴趣，而一个线程进行阻塞调用并处理来自操作系统的通知。
+
+注意
+mio 不允许你在同一个 Poll::poll 调用上有多个线程被阻塞，这并不是由于 epoll、kqueue 或 IOCP 的限制。它们都允许多个线程在同一个实例上调用 Poll::poll 并获取队列中的事件通知。epoll 甚至允许特定的标志来指示操作系统是否应该只唤醒一个或所有等待通知的线程（特别是 EPPOLLEXCLUSIVE 标志）。
+
+这个问题部分是关于不同平台如何决定唤醒哪些线程，当有许多线程在同一个队列上等待事件时，部分是关于似乎对这种功能没有太大兴趣的事实。例如，epoll 默认会唤醒所有阻塞在 Poll 上的线程，而 Windows 默认只会唤醒一个线程。你可以在一定程度上修改这种行为，并且未来也有在 Poll 上实现 try_clone 方法的想法。目前，设计就像我们概述的那样，我们也会在我们的示例中坚持这一点。
+
+这让我们来到了另一个话题，我们应该在开始实现我们的示例之前讨论它。
+
+
+* 所有 I/O 操作都是阻塞的吗？
+最后，这是一个容易回答的问题。答案是响亮的……也许。问题是，并非所有的 I/O 操作都会以操作系统挂起调用线程的方式进行阻塞，并且切换到另一个任务会更高效。原因是操作系统很聪明，会在内存中缓存大量信息。如果信息在缓存中，请求该信息的系统调用将立即返回数据，因此强制上下文切换或重新调度当前任务可能比同步处理数据效率更低。问题在于，无法确定 I/O 是否会阻塞，这取决于你在做什么。
+
+让我给你两个例子。
+
+DNS 查找
+在创建 TCP 连接时，首先需要将典型地址（如 www.google.com）转换为 IP 地址（如 216.58.207.228）。操作系统维护了一个本地地址和之前查找过的地址的映射缓存，几乎可以立即解析它们。然而，第一次查找未知地址时，可能必须调用 DNS 服务器，这需要很长时间，如果未以非阻塞方式处理，操作系统将挂起调用线程以等待响应。
+
+文件 I/O
+本地文件系统上的文件是操作系统进行大量缓存的另一个领域。经常读取的较小文件通常缓存在内存中，因此请求该文件可能根本不会阻塞。如果你有一个提供静态文件的 Web 服务器，很可能你提供的是一组相当有限的小文件。这些文件很可能缓存在内存中。然而，无法确定——如果操作系统内存不足，可能必须将内存页面映射到硬盘，这使得通常非常快速的内存查找变得极其缓慢。如果你随机访问大量小文件，或者提供非常大的文件，也会遇到同样的情况，因为操作系统只会缓存有限的信息。如果你在同一操作系统上运行许多不相关的进程，也可能会遇到这种不可预测性，因为它可能不会缓存对你重要的信息。
+
+处理这些情况的一种流行方法是忘记非阻塞 I/O，实际上改为进行阻塞调用。你不希望在运行 Poll 实例的同一线程中进行这些调用（因为每个小的延迟都会阻塞所有任务），但你可能会将该任务委托给线程池。在线程池中，你有有限数量的线程，负责进行常规的阻塞调用，例如 DNS 查找或文件 I/O。
+
+一个完全这样做的运行时的例子是 libuv（http://docs.libuv.org/en/v1.x/threadpool.html#threadpool）。libuv 是 Node.js 构建的异步 I/O 库。虽然它的范围比 mio 更大（mio 只关心非阻塞 I/O），但 libuv 在 JavaScript 中对 Node 的作用，就像 mio 在 Rust 中对 Tokio 的作用一样。
+
+
+
+注意
+在线程池中执行文件 I/O 的原因是，历史上跨平台的非阻塞文件 I/O API 表现不佳。虽然许多运行时确实选择将此任务委托给线程池，向操作系统发出阻塞调用，但随着操作系统 API 的不断发展，这种情况在未来可能不再适用。创建一个线程池来处理这些情况超出了本示例的范围（即使 mio 也认为这超出了其范围，只是为了明确）。我们将重点展示 epoll 的工作原理，并在文本中提到这些主题，尽管我们不会在本示例中实际实现解决方案。
+
+现在我们已经介绍了关于 epoll、mio 以及示例设计的许多基本信息，是时候编写一些代码并亲自看看这一切在实践中是如何工作的了。
+
+ffi 模块
+让我们从那些不依赖其他模块的模块开始，然后逐步展开。ffi 模块包含与操作系统通信所需的系统调用和数据结构的映射。我们还将详细介绍 epoll 的工作原理，一旦我们介绍了系统调用。这部分只有几行代码，所以我会将第一部分放在这里，以便更容易跟踪我们在文件中的位置，因为有很多内容需要解释。打开 ffi.rs 文件并编写以下代码：
+
+ch04/a-epoll/src/ffi.rs
+pub const EPOLL_CTL_ADD: i32 = 1;
+pub const EPOLLIN: i32 = 0x1;
+pub const EPOLLET: i32 = 1 << 31;
+
+#[link(name = "c")]
+extern "C" {
+    pub fn epoll_create(size: i32) -> i32;
+    pub fn close(fd: i32) -> i32;
+    pub fn epoll_ctl(epfd: i32, op: i32, fd: i32, event: *mut Event) -> i32;
+    pub fn epoll_wait(epfd: i32, events: *mut Event, maxevents: i32, timeout: i32) -> i32;
+}
+你首先会注意到我们声明了几个常量，分别是 EPOLL_CTL_ADD、EPOLLIN 和 EPOLLET。稍后我会解释这些常量的含义。让我们先看看我们需要进行的系统调用。幸运的是，我们已经详细介绍了系统调用，所以你已经了解了 ffi 的基础知识以及为什么我们在前面的代码中链接到 C。
+
+
+epoll_create 是我们用来创建 epoll 队列的系统调用。你可以在 https://man7.org/linux/man-pages/man2/epoll_create.2.html 找到它的文档。这个方法接受一个名为 size 的参数，但 size 参数仅出于历史原因存在。该参数会被忽略，但必须大于 0。
+
+close 是我们用来关闭在创建 epoll 实例时获得的文件描述符的系统调用，以便正确释放资源。你可以在 https://man7.org/linux/man-pages/man2/close.2.html 阅读该调用的文档。
+
+epoll_ctl 是我们用来对 epoll 实例执行操作的控制接口。这是我们用来注册对某个事件源感兴趣的事件时所使用的调用。它支持三种主要操作：添加、修改或删除。第一个参数 epfd 是我们想要执行操作的 epoll 文件描述符。第二个参数 op 是我们指定要执行添加、修改还是删除操作的参数。在我们的例子中，我们只对添加事件感兴趣，因此我们只传递 EPOLL_CTL_ADD，这是表示我们要执行添加操作的值。
+
+epoll_event 稍微复杂一些，因此我们将更详细地讨论它。它为我们做了两件重要的事情：首先，events 字段表示我们想要被通知的事件类型，它还可以修改我们如何以及何时收到通知的行为。其次，data 字段向内核传递一段数据，当事件发生时，内核会将此数据返回给我们。后者很重要，因为我们需要这些数据来准确识别发生了什么事件，因为这是我们唯一会收到的信息，可以用来识别通知的来源。你可以在 https://man7.org/linux/man-pages/man2/epoll_ctl.2.html 找到该调用的文档。
+
+epoll_wait 是阻塞当前线程并等待以下两种情况之一的调用：我们收到事件发生的通知，或者超时。epfd 是标识我们通过 epoll_create 创建的队列的 epoll 文件描述符。events 是一个与我们在 epoll_ctl 中使用的相同 Event 结构的数组。不同之处在于，events 字段现在为我们提供了有关发生的事件的信息，重要的是 data 字段包含我们在注册兴趣时传递的相同数据。例如，data 字段让我们可以识别哪个文件描述符有数据可以读取。maxevents 参数告诉内核我们在数组中预留了多少事件的空间。最后，timeout 参数告诉内核我们在等待事件时最多等待多长时间，然后它会再次唤醒我们，以免我们可能永远阻塞。你可以在 https://man7.org/linux/man-pages/man2/epoll_wait.2.html 阅读 epoll_wait 的文档。
+
+该文件中代码的最后一部分是 Event 结构体：
+
+ch04/a-epoll/src/ffi.rs
+#[derive(Debug)]
+#[repr(C, packed)]
+pub struct Event {
+    pub(crate) events: u32,
+    // Token to identify event
+    pub(crate) epoll_data: usize,
+}
+
+impl Event {
+    pub fn token(&self) -> usize {
+        self.epoll_data
+    }
+}
+这个结构体用于在 epoll_ctl 中与操作系统通信，操作系统在 epoll_wait 中使用相同的结构体与我们通信。
+
+events 被定义为一个 u32，但它不仅仅是一个数字。这个字段是我们所说的位掩码（bitmask）。我稍后会花时间解释位掩码，因为它在大多数系统调用中很常见，并不是每个人都遇到过。简单来说，它是一种使用二进制位表示一组是/否标志的方式，用来指示是否选择了某个选项。
+
+不同的选项在我提供的 epoll_ctl 系统调用链接中有描述。我不会在这里详细解释所有选项，只介绍我们将使用的选项：
+
+EPOLLIN 表示一个位标志，表示我们对文件句柄上的读操作感兴趣。
+EPOLLET 表示一个位标志，表示我们希望以边缘触发模式接收事件通知。
+
+
+Event 结构体的最后一个字段是 epoll_data。在文档中，这个字段被定义为一个联合体（union）。联合体很像枚举（enum），但与 Rust 的枚举不同，它不携带任何关于其类型的信息，因此我们需要确保我们知道它持有的数据类型。
+
+我们使用这个字段来简单地保存一个 usize，以便在使用 epoll_ctl 注册兴趣时传递一个整数来标识每个事件。传递一个指针也是完全可以的——只要我们确保在 epoll_wait 中返回时指针仍然有效。
+
+我们可以将这个字段视为一个令牌（token），这正是 mio 所做的。为了尽可能保持 API 的相似性，我们模仿 mio 并在结构体上提供一个 token 方法来获取这个值。
+
+#[repr(packed)] 的作用是什么？
+#[repr(packed)] 注解对我们来说是新的。通常，结构体在字段之间或结构体末尾会有填充（padding）。即使我们指定了 #[repr(C)]，这种情况也会发生。
+
+原因与高效访问存储在结构体中的数据有关，通过不需要多次获取来访问存储在结构体字段中的数据。对于 Event 结构体，通常的填充会在 events 字段的末尾添加 4 字节的填充。当操作系统期望一个紧凑的 Event 结构体时，而我们给它一个填充过的结构体，它将会把 event_data 的部分写入字段之间的填充中。当你稍后尝试读取 event_data 时，你最终只会读取 event_data 的最后部分，这部分恰好重叠并导致读取错误的数据。
+
+
+操作系统期望一个紧凑的 Event 结构体这一事实并不明显，仅通过阅读 Linux 的手册页是无法得知的，因此你必须阅读适当的 C 头文件才能确定。当然，你也可以简单地依赖 libc crate（https://github.com/rust-lang/libc），如果我们不是为了自己学习这些东西，我们也会这样做。
+
+现在我们已经完成了代码的讲解，有几个话题我们之前承诺会回过头来讨论。
+
+位标志（Bitflags）和位掩码（Bitmasks）
+在进行系统调用时，你会经常遇到这个概念（事实上，位掩码的概念在低级编程中非常常见）。位掩码是一种将每个位视为开关或标志的方式，用于指示某个选项是启用还是禁用。
+
+
+一个整数，比如 i32，可以用 32 位来表示。EPOLLIN 的十六进制值是 0x1（十进制就是 1）。用位表示的话，它看起来像 00000000000000000000000000000001。另一方面，EPOLLET 的值是 1 << 31。这意味着将十进制数 1 的位表示向左移动 31 位。十进制数 1 恰好与 EPOLLIN 相同，因此通过查看该表示并将位向左移动 31 次，我们得到一个位表示为 10000000000000000000000000000000 的数字。
+
+我们使用位标志的方式是使用 OR 运算符 |，通过将值进行 OR 操作，我们得到一个位掩码，其中每个 OR 操作的标志都被设置为 1。在我们的例子中，位掩码看起来像 10000000000000000000000000000001。
+
+位掩码的接收者（在这种情况下是操作系统）可以执行相反的操作，检查设置了哪些标志，并相应地采取行动。
+
+我们可以用代码创建一个非常简单的示例来展示这在实践中是如何工作的（你可以直接在 Rust Playground 中运行这个代码，或者创建一个新的空项目来进行这样的实验）：
+
+fn main() {
+    let bitflag_a: i32 = 1 << 31;
+    let bitflag_b: i32 = 0x1;
+    let bitmask: i32 = bitflag_a | bitflag_b;
+    println!("{bitflag_a:032b}");
+    println!("{bitflag_b:032b}");
+    println!("{bitmask:032b}");
+    check(bitmask);
+}
+
+fn check(bitmask: i32) {
+    const EPOLLIN: i32 = 0x1;
+    const EPOLLET: i32 = 1 << 31;
+    const EPOLLONESHOT: i32 = 0x40000000;
+    let read = bitmask & EPOLLIN != 0;
+    let et = bitmask & EPOLLET != 0;
+    let oneshot = bitmask & EPOLLONESHOT != 0;
+    println!("read_event? {read}, edge_triggered: {et}, oneshot?: {oneshot}")
+}
+这段代码将输出以下内容：
+
+10000000000000000000000000000000
+00000000000000000000000000000001
+10000000000000000000000000000001
+read_event? true, edge_triggered: true, oneshot?: false
+在本章中，我们将介绍的下一个主题是边缘触发事件的概念，这可能需要一些解释。
+
+水平触发与边缘触发事件
+在一个理想的世界里，我们不需要讨论这个问题，但在使用 epoll 时，几乎不可能避免了解这两者之间的区别。通过阅读文档并不明显，尤其是如果你之前没有接触过这些术语。有趣的是，它允许我们在 epoll 中处理事件的方式与硬件级别处理事件的方式之间建立一种平行关系。
+
+epoll 可以以水平触发或边缘触发模式通知事件。如果你的主要经验是使用高级语言编程，这听起来一定非常晦涩（我第一次学习时也是如此），但请耐心听我解释。在 Event 结构体的事件位掩码中，我们设置 EPOLLET 标志以在边缘触发模式下获得通知（如果你不指定任何内容，默认是水平触发）。
+
+这种事件通知和事件处理的建模方式与计算机处理中断的方式有很多相似之处。
+
+水平触发意味着只要中断线上的电信号报告为高电平，那么“事件是否发生”这个问题的答案就是真。如果我们将此转换到我们的示例中，只要与文件句柄关联的缓冲区中有数据，读取事件就已经发生。
+
+在处理中断时，你可以通过服务引发中断的硬件来清除中断，或者你可以屏蔽中断，这只是在明确解除屏蔽之前禁用该线上的中断。
+
+在我们的示例中，我们通过读取缓冲区中的所有数据来清除中断。当缓冲区被清空时，问题的答案变为假。
+
+当使用 epoll 的默认模式（水平触发）时，我们可能会遇到一种情况，即我们在同一事件上收到多个通知，因为我们还没有时间清空缓冲区（记住，只要缓冲区中有数据，epoll 就会一遍又一遍地通知你）。当我们有一个线程报告事件，然后将处理事件的任务（从流中读取）委托给其他工作线程时，这一点尤其明显，因为 epoll 会愉快地报告事件已准备好，即使我们正在处理它。
+
+为了解决这个问题，epoll 有一个名为 EPOLLONESHOT 的标志。EPOLLONESHOT 告诉 epoll，一旦我们在这个文件描述符上接收到一个事件，它应该禁用兴趣列表中的该文件描述符。它不会移除它，但我们不会再收到该文件描述符的任何通知，除非我们通过调用 epoll_ctl 并使用 EPOLL_CTL_MOD 参数和一个新的位掩码显式重新激活它。
+
+如果我们没有添加这个标志，可能会发生以下情况：如果线程 1 是我们调用 epoll_wait 的线程，那么一旦它接收到关于读取事件的通知，它就会启动线程 2 中的任务来从该文件描述符读取数据，然后再次调用 epoll_wait 以获取新事件的通知。在这种情况下，epoll_wait 的调用将再次返回，并告诉我们同一文件描述符上的数据已准备好，因为我们还没有时间清空该文件描述符的缓冲区。我们知道任务由线程 2 处理，但我们仍然会收到通知。如果没有额外的同步和逻辑，我们可能会将读取同一文件描述符的任务交给线程 3，这可能会导致一些非常难以调试的问题。
+
+使用 EPOLLONESHOT 可以解决这个问题，因为线程 2 在处理完任务后必须重新激活事件队列中的文件描述符，从而告诉我们的 epoll 队列它已经完成了任务，并且我们再次对该文件描述符的通知感兴趣。
+
+回到我们最初的中断类比，EPOLLONESHOT 可以被认为是屏蔽中断。你还没有真正清除事件通知的源头，但你不想在完成并显式解除屏蔽之前收到进一步的通知。在 epoll 中，EPOLLONESHOT 标志将禁用文件描述符上的通知，直到你通过调用 epoll_ctl 并将 op 参数设置为 EPOLL_CTL_MOD 来显式启用它。
+
+边缘触发意味着“事件是否发生”这个问题的答案只有在电信号从低电平变为高电平时才为真。如果我们将此转换到我们的示例中：当缓冲区从没有数据变为有数据时，读取事件已经发生。只要缓冲区中有数据，就不会报告新的事件。你仍然通过从套接字中读取所有数据来处理事件，但在缓冲区完全清空并再次填充新数据之前，你不会收到新的通知。
+
+边缘触发模式也有一些陷阱。最大的一个问题是，如果你没有正确清空缓冲区，你将永远不会再收到该文件句柄的通知。
+
+
+图 4.1 – 边缘触发与水平触发事件
+
+在撰写本文时，mio 并不支持 EPOLLONESHOT，并且以边缘触发模式使用 epoll，我们在示例中也会这样做。
+
+关于在多个线程中等待 epoll_wait 的问题
+
+只要我们只有一个 Poll 实例，就可以避免多个线程在同一 epoll 实例上调用 epoll_wait 的问题和复杂性。使用水平触发事件会唤醒所有在 epoll_wait 调用中等待的线程，导致它们都尝试处理事件（这通常被称为“惊群问题”）。epoll 还有一个你可以设置的标志，称为 EPOLLEXCLUSIVE，可以解决这个问题。默认情况下，设置为边缘触发的事件只会唤醒一个在 epoll_wait 中阻塞的线程，从而避免这个问题。
+
+由于我们只从单个线程使用一个 Poll 实例，这对我们来说不会成为问题。
+
+我知道并理解这听起来非常复杂。事件队列的一般概念相当简单，但细节可能会有些复杂。话虽如此，epoll 是我经验中最复杂的 API 之一，因为该 API 显然随着时间的推移不断演变，以适应现代需求，并且如果不至少涵盖我们在这里讨论的主题，实际上没有简单的方法可以正确使用和理解它。
+
+这里有一点安慰是，kqueue 和 IOCP 的 API 更容易理解。此外，Unix 有一个新的异步 I/O 接口，称为 io_uring，它在未来会变得越来越普遍。
+
+现在我们已经介绍了本章的难点，并对 epoll 的工作原理有了一个高层次的概述，是时候在 poll.rs 中实现我们受 mio 启发的 API 了。
+
+Poll 模块
+
+如果你还没有编写或复制我们在“设计和 epoll 介绍”部分中提供的代码，现在是时候这样做了。我们将实现所有之前只有 todo!() 的函数。
+
+我们首先在 Poll 结构体上实现方法。首先是打开 impl Poll 块并实现 new 函数：
+
+ch04/a-epoll/src/poll.rs
+impl Poll {
+    pub fn new() -> Result<Self> {
+        let res = unsafe { ffi::epoll_create(1) };
+        if res < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self {
+            registry: Registry { raw_fd: res },
+        })
+    }
+鉴于在“ffi 模块”部分中对 epoll 的详细介绍，这应该相当简单。我们调用 ffi::epoll_create，参数为 1（记住，该参数被忽略，但必须具有非零值）。如果我们得到任何错误，我们会要求操作系统报告我们进程的最后一个错误并返回该错误。如果调用成功，我们返回一个新的 Poll 实例，它只是包装了包含 epoll 文件描述符的 Registry。
+
+接下来是我们的 registry 方法，它只是返回对内部 Registry 结构体的引用：
+
+ch04/a-epoll/src/poll.rs
+    pub fn registry(&self) -> &Registry {
+        &self.registry
+    }
+Poll 上的最后一个方法是最有趣的一个。它是 poll 函数，它将暂停当前线程，并告诉操作系统在我们跟踪的源上发生事件或超时（以先到者为准）时唤醒它。我们在这里也关闭了 impl Poll 块：
+
+ch04/a-epoll/src/poll.rs
+    pub fn poll(&mut self, events: &mut Events, timeout: Option<i32>) -> Result<()> {
+        let fd = self.registry.raw_fd;
+        let timeout = timeout.unwrap_or(-1);
+        let max_events = events.capacity() as i32;
+        let res = unsafe { ffi::epoll_wait(fd, events.as_mut_ptr(), max_events, timeout) };
+        if res < 0 {
+            return Err(io::Error::last_os_error());
+        };
+        unsafe { events.set_len(res as usize) };
+        Ok(())
+    }
+}
+我们做的第一件事是获取事件队列的原始文件描述符并将其存储在 fd 变量中。
+
+
+接下来是我们的超时设置。如果它是 Some，我们解包该值；如果它是 None，我们将其设置为 -1，这个值告诉操作系统我们希望阻塞直到事件发生，即使这可能永远不会发生。
+
+在文件的顶部，我们将 Events 定义为 Vec<ffi::Event> 的类型别名，因此接下来我们要做的是获取该 Vec 的容量。重要的是我们不要依赖 Vec::len，因为它报告的是 Vec 中有多少项。Vec::capacity 报告我们分配的空间，而这正是我们所需要的。
+
+接下来是调用 ffi::epoll_wait。如果返回值大于或等于 0，该调用将成功返回，告诉我们发生了多少事件。
+
+注意：如果在事件发生之前超时，我们将得到值为 0。
+
+我们做的最后一件事是对 events.set_len(res as usize) 进行不安全调用。这个函数是不安全的，因为我们可能会设置长度，从而在安全的 Rust 中访问尚未初始化的内存。我们从操作系统提供的保证中知道，它返回的事件数量指向我们 Vec 中的有效数据，因此在这种情况下这是安全的。
+
+接下来是我们的 Registry 结构体。我们只实现一个名为 register 的方法，最后，我们为其实现 Drop trait，关闭 epoll 实例：
+
+ch04/a-epoll/src/poll.rs
+impl Registry {
+    pub fn register(&self, source: &TcpStream, token: usize, interests: i32) -> Result<()> {
+        let mut event = ffi::Event {
+            events: interests as u32,
+            epoll_data: token,
+        };
+        let op = ffi::EPOLL_CTL_ADD;
+        let res = unsafe {
+            ffi::epoll_ctl(self.raw_fd, op, source.as_raw_fd(), &mut event)
+        };
+        if res < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
+register 函数接受一个 &TcpStream 作为源，一个 usize 类型的 token，以及一个名为 interests 的位掩码，其类型为 i32。
+
+注意：这是 mio 做不同事情的地方。source 参数是特定于每个平台的。register 的实现不是在 Registry 上处理的，而是在它接收的 source 参数中以平台特定的方式处理的。
+
+我们做的第一件事是创建一个 ffi::Event 对象。events 字段简单地设置为我们接收到的位掩码 interests，而 epoll_data 设置为我们传入的 token 参数的值。
+
+
+
+我们希望在 epoll 队列上执行的操作是添加对新文件描述符事件的兴趣。因此，我们将 op 参数设置为 ffi::EPOLL_CTL_ADD 常量值。
+
+接下来是调用 ffi::epoll_ctl。我们首先传入 epoll 实例的文件描述符，然后传入 op 参数以指示我们要执行的操作类型。最后两个参数是我们希望队列跟踪的文件描述符和我们创建的 Event 对象，用于指示我们感兴趣的事件类型。
+
+函数体的最后一部分是错误处理，这部分现在应该已经很熟悉了。
+
+poll.rs 的最后一部分是 Registry 的 Drop 实现：
+
+ch04/a-epoll/src/poll.rs
+impl Drop for Registry {
+    fn drop(&mut self) {
+        let res = unsafe { ffi::close(self.raw_fd) };
+        if res < 0 {
+            let err = io::Error::last_os_error();
+            eprintln!("ERROR: {err:?}");
+        }
+    }
+}
+Drop 实现简单地调用了 ffi::close 来关闭 epoll 文件描述符。在 drop 中添加 panic 通常不是一个好主意，因为 drop 可能已经在 panic 中被调用，这会导致进程直接中止。mio 在其 Drop 实现中记录错误，但不会以其他方式处理它们。对于我们这个简单的示例，我们只是打印错误，以便我们可以看到是否出现问题，因为我们在这里没有实现任何日志记录。
+
+最后一部分是运行我们示例的代码，这引导我们进入 main.rs。
+
+主程序
+让我们看看这一切在实践中是如何工作的。确保 delayserver 已启动并运行，因为我们需要它才能使这些示例正常工作。
+
+目标是向 delayserver 发送一组具有不同延迟的请求，然后使用 epoll 等待响应。因此，在此示例中，我们仅使用 epoll 来跟踪读取事件。目前，该程序的功能仅限于此。
+
+我们要做的第一件事是确保我们的 main.rs 文件设置正确：
+
+ch04/a-epoll/src/main.rs
+use std::{io::{self, Read, Result, Write}, net::TcpStream};
+use ffi::Event;
+use poll::Poll;
+
+mod ffi;
+mod poll;
+我们从自己的 crate 和标准库中导入了一些类型，这些类型将在后续使用，同时我们还声明了两个模块。
+
+在此示例中，我们将直接使用 TcpStream，这意味着我们必须自己格式化向 delayserver 发出的 HTTP 请求。
+
+服务器将接受 GET 请求，因此我们创建了一个小的辅助函数来为我们格式化有效的 HTTP GET 请求：
+
+ch04/a-epoll/src/main.rs
+fn get_req(path: &str) -> Vec<u8> {
+    format!(
+        "GET {path} HTTP/1.1\r\n\
+         Host: localhost\r\n\
+         Connection: close\r\n\
+         \r\n"
+    ).into_bytes()
+}
+前面的代码简单地接受一个路径作为输入参数，并使用它格式化一个有效的 GET 请求。路径是 URL 中方案和主机之后的部分。在我们的例子中，路径将是以下 URL 中加粗的部分：http://localhost:8080/2000/hello-world。
+
+接下来是我们的 main 函数。它分为两部分：
+
+设置和发送请求
+等待并处理传入事件
+main 函数的第一部分如下所示：
+
+
+fn main() -> Result<()> {
+    let mut poll = Poll::new()?;
+    let n_events = 5;
+    let mut streams = vec![];
+    let addr = "localhost:8080";
+    for i in 0..n_events {
+        let delay = (n_events - i) * 1000;
+        let url_path = format!("/{delay}/request-{i}");
+        let request = get_req(&url_path);
+        let mut stream = std::net::TcpStream::connect(addr)?;
+        stream.set_nonblocking(true)?;
+        stream.write_all(request.as_bytes())?;
+        poll.registry()
+            .register(&stream, i, ffi::EPOLLIN | ffi::EPOLLET)?;
+        streams.push(stream);
+    }
+我们要做的第一件事是创建一个新的 Poll 实例。我们还指定了在示例中要创建和处理的事件数量。
+
+下一步是创建一个变量来保存 Vec<TcpStream> 对象的集合。我们还将本地 delayserver 的地址存储在一个名为 addr 的变量中。
+
+接下来的部分是我们创建一组请求并将其发送到 delayserver，最终 delayserver 会响应我们。对于每个请求，我们期望稍后在发送请求的 TcpStream 上发生读取事件。
+
+在循环中，我们做的第一件事是设置延迟时间（以毫秒为单位）。将延迟设置为 (n_events - i) * 1000 意味着我们发出的第一个请求将具有最长的超时时间，因此我们应该期望响应以与发送顺序相反的顺序到达。
+
+注意：为了简单起见，我们使用事件在 streams 集合中的索引作为其 ID。此 ID 将与循环中的 i 变量相同。例如，在第一次循环中，i 将为 0；它也将是第一个被推送到 streams 集合中的流，因此索引也将为 0。因此，我们始终使用 0 作为此流/事件的标识符，因为检索与此事件关联的 TcpStream 只需在 streams 集合中索引到该位置即可。
+
+下一行 format!("/{delay}/request-{i}") 格式化我们的 GET 请求的路径。我们按照前面描述的方式设置超时，并且还设置了一个消息，其中存储了此事件的标识符 i，以便我们也可以在服务器端跟踪此事件。
+
+接下来是创建 TcpStream。你可能已经注意到，Rust 中的 TcpStream 不接受 &str，而是接受实现了 ToSocketAddrs 特征的参数。该特征已经为 &str 实现，因此我们可以像在此示例中那样简单地编写它。
+
+在 TcpStream::connect 实际打开套接字之前，它会尝试将我们传递的地址解析为 IP 地址。如果失败，它将将其解析为域名和端口号，然后要求操作系统对该地址进行 DNS 查找，然后才能实际连接到我们的服务器。因此，你可以看到，当我们进行简单的连接时，可能会发生相当多的事情。
+
+你可能还记得我们之前讨论过 DNS 查找的一些细微差别，以及这样一个调用可能非常快（因为操作系统已经将信息存储在内存中）或阻塞（等待 DNS 服务器的响应）的事实。如果你希望完全控制整个过程，使用标准库中的 TcpStream 可能会带来潜在的缺点。
+
+
+Rust 中的 TcpStream 和 Nagle 算法
+这里有一个小事实（我原本想称之为“有趣的事实”，但后来意识到这有点过于牵强了！）。在 Rust 的 TcpStream 中，更重要的是，大多数旨在模仿标准库 TcpStream 的 API（如 mio 或 Tokio），流在创建时默认将 TCP_NODELAY 标志设置为 false。实际上，这意味着使用了 Nagle 算法，这可能会导致一些延迟异常问题，并在某些工作负载下可能降低吞吐量。
+
+Nagle 算法是一种旨在通过将小型网络数据包合并在一起来减少网络拥塞的算法。如果你查看其他语言中的非阻塞 I/O 实现，许多（如果不是大多数）默认情况下会禁用此算法。然而，在大多数 Rust 实现中并非如此，这一点值得注意。你可以通过简单地调用 TcpStream::set_nodelay(true) 来禁用它。如果你尝试创建自己的异步库或依赖 Tokio/mio，并观察到吞吐量低于预期或延迟问题，值得检查此标志是否设置为 true。
+
+继续代码部分，下一步是通过调用 TcpStream::set_nonblocking(true) 将 TcpStream 设置为非阻塞模式。之后，我们通过设置 EPOLLIN 标志位在兴趣位掩码中注册对读取事件的兴趣，然后将请求写入服务器。
+
+在每次迭代中，我们将流推送到 streams 集合的末尾。
+
+接下来是主函数中处理传入事件的部分。让我们看一下主函数的最后一部分：
+
+let mut handled_events = 0;
+while handled_events < n_events {
+    let mut events = Vec::with_capacity(10);
+    poll.poll(&mut events, None)?;
+    if events.is_empty() {
+        println!("TIMEOUT (OR SPURIOUS EVENT NOTIFICATION)");
+        continue;
+    }
+    handled_events += handle_events(&events, &mut streams)?;
+}
+println!("FINISHED");
+Ok(())
+我们做的第一件事是创建一个名为 handled_events 的变量，用于跟踪我们已经处理了多少事件。
+
+接下来是我们的 事件循环。只要处理的事件少于我们预期的事件数量，我们就会继续循环。一旦所有事件都被处理完毕，我们就退出循环。
+
+
+循环内部的操作
+在循环内部，我们创建了一个 Vec<Event>，其容量为存储 10 个事件。重要的是，我们使用 Vec::with_capacity 来创建它，因为操作系统会假设我们传递给它的是已经分配的内存。我们可以选择任意数量的事件，这都能正常工作，但如果设置得太低，会限制操作系统每次唤醒时可以通知我们的事件数量。
+
+接下来是我们对 Poll::poll 的阻塞调用。如你所知，这实际上会告诉操作系统暂停我们的线程，并在事件发生时唤醒我们。
+
+如果我们被唤醒，但事件列表中没有事件，那么这可能是超时或虚假事件（这种情况可能会发生，因此如果对我们来说很重要，我们需要一种方法来检查是否真的发生了超时）。如果是这种情况，我们只需再次调用 Poll::poll。
+
+如果有事件需要处理，我们将这些事件与 streams 集合的可变引用一起传递给 handle_events 函数。
+
+主函数的最后部分只是简单地向控制台写入 FINISHED，以让我们知道我们在这一点上退出了主函数。
+
+本章的最后一段代码是 handle_events 函数。该函数接受两个参数：一个 Event 结构体的切片和一个 TcpStream 对象的可变切片。
+
+让我们在解释之前先看一下代码：
+
+fn handle_events(events: &[Event], streams: &mut [TcpStream]) -> Result<usize> {
+    let mut handled_events = 0;
+    for event in events {
+        let index = event.token();
+        let mut data = vec![0u8; 4096];
+        loop {
+            match streams[index].read(&mut data) {
+                Ok(n) if n == 0 => {
+                    handled_events += 1;
+                    break;
+                }
+                Ok(n) => {
+                    let txt = String::from_utf8_lossy(&data[..n]);
+                    println!("RECEIVED: {:?}", event);
+                    println!("{txt}\n------\n");
+                }
+                // 非阻塞模式下尚未准备好读取。即使事件被报告为就绪，这也可能发生
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    Ok(handled_events)
+}
+我们做的第一件事是创建一个变量 handled_events，用于跟踪每次唤醒时我们认为已经处理了多少事件。下一步是遍历我们收到的事件。
+
+在循环中，我们检索标识我们收到事件的 TcpStream 的令牌。正如我们在这个示例中之前解释的那样，这个令牌与 streams 集合中特定流的索引相同，因此我们可以简单地使用它来索引到我们的 streams 集合并检索正确的 TcpStream。
+
+在我们开始读取数据之前，我们创建了一个大小为 4,096 字节的缓冲区（当然，如果你愿意，可以分配更大或更小的缓冲区）。
+
+我们创建了一个循环，因为我们可能需要多次调用 read 以确保我们确实已经排空了缓冲区。请记住，在使用边缘触发模式的 epoll 时，完全排空缓冲区是多么重要。
+
+我们根据调用 TcpStream::read 的结果进行匹配，因为我们希望根据结果采取不同的操作。
+
+
+
+处理读取结果
+如果我们得到 Ok(n) 并且值为 0，说明我们已经排空了缓冲区；我们将该事件视为已处理，并跳出循环。
+
+如果我们得到 Ok(n) 并且值大于 0，我们将数据读取到一个 String 中，并以一定的格式打印出来。我们暂时不会跳出循环，因为我们必须继续调用 read，直到返回 0（或发生错误），以确保我们已经完全排空了缓冲区。
+
+如果我们得到 Err 并且错误类型为 io::ErrorKind::WouldBlock，我们只需跳出循环。我们暂时不认为该事件已处理，因为 WouldBlock 表示数据传输尚未完成，但目前没有数据准备好。
+
+如果我们得到任何其他错误，我们直接返回该错误并将其视为失败。
+
+注意：
+
+通常你还需要处理另一种错误情况，即 io::ErrorKind::Interrupted。从流中读取数据可能会被操作系统的信号中断。这种情况应该被预期，并且通常不应被视为失败。处理这种情况的方式与处理 WouldBlock 类型的错误相同。
+
+如果读取操作成功，我们返回已处理的事件数量。
+
+
+使用 TcpStream::read_to_end 时要小心
+在使用 TcpStream::read_to_end 或任何其他为你完全排空缓冲区的函数时，要特别小心，尤其是在使用非阻塞缓冲区的情况下。如果你遇到 io::ErrorKind::WouldBlock 类型的错误，它会报告为错误，即使在此之前你已经成功读取了多次。你无法知道成功读取了多少数据，除非观察传递给函数的 &mut Vec 的变化。
+
+现在，如果我们运行我们的程序，应该会得到以下输出：
+
+RECEIVED: Event { events: 1, epoll_data: 4 }
+HTTP/1.1 200 OK
+content-length: 9
+connection: close
+content-type: text/plain; charset=utf-8
+date: Wed, 04 Oct 2023 15:29:09 GMT
+request-4
+------
+RECEIVED: Event { events: 1, epoll_data: 3 }
+HTTP/1.1 200 OK
+content-length: 9
+connection: close
+content-type: text/plain; charset=utf-8
+date: Wed, 04 Oct 2023 15:29:10 GMT
+request-3
+------
+RECEIVED: Event { events: 1, epoll_data: 2 }
+HTTP/1.1 200 OK
+content-length: 9
+connection: close
+content-type: text/plain; charset=utf-8
+date: Wed, 04 Oct 2023 15:29:11 GMT
+request-2
+------
+RECEIVED: Event { events: 1, epoll_data: 1 }
+HTTP/1.1 200 OK
+content-length: 9
+connection: close
+content-type: text/plain; charset=utf-8
+date: Wed, 04 Oct 2023 15:29:12 GMT
+request-1
+------
+RECEIVED: Event { events: 1, epoll_data: 0 }
+HTTP/1.1 200 OK
+content-length: 9
+connection: close
+content-type: text/plain; charset=utf-8
+date: Wed, 04 Oct 2023 15:29:13 GMT
+request-0
+------
+FINISHED
+如你所见，响应是以相反的顺序发送的。你可以通过查看运行 delayserver 实例时的终端输出来轻松确认这一点。输出应该如下所示：
+
+#1 - 5000ms: request-0
+#2 - 4000ms: request-1
+#3 - 3000ms: request-2
+#4 - 2000ms: request-3
+#5 - 1000ms: request-4
+有时顺序可能会有所不同，因为服务器几乎同时接收到它们，并可能选择以略微不同的顺序处理它们。
+
+假设我们跟踪 ID 为 4 的流上的事件
+在 send_requests 中，我们将 ID 4 分配给我们创建的最后一个流。
+套接字 4 向 delayserver 发送一个请求，设置 1,000 毫秒的延迟，并发送消息 request-4，以便我们可以在服务器端识别它。
+我们将套接字 4 注册到事件队列中，确保将 epoll_data 字段设置为 4，以便我们可以识别事件发生在哪个流上。
+delayserver 接收到该请求，并在发送 HTTP/1.1 200 OK 响应之前延迟 1,000 毫秒，同时返回我们最初发送的消息。
+epoll_wait 唤醒，通知我们有一个事件准备就绪。在 Event 结构体的 epoll_data 字段中，我们得到与注册事件时传入的相同数据。这告诉我们事件发生在流 4 上。
+然后我们从流 4 读取数据并打印出来。
+在这个例子中，尽管我们使用了标准库来处理建立连接的复杂性，但我们仍然保持了非常底层的操作。尽管你实际上已经向本地服务器发出了一个原始的 HTTP 请求，但你设置了一个 epoll 实例来跟踪 TcpStream 上的事件，并使用 epoll 和系统调用来处理传入的事件。
+
+这可不是一件小事——恭喜你！
+
+在我们离开这个例子之前，我想指出，为了使我们的例子使用 mio 作为事件循环，而不是我们自己创建的那个，我们需要做的改动非常少。在 ch04/b-epoll-mio 目录下的代码库中，你会看到一个我们使用 mio 做完全相同事情的例子。它只需要从 mio 导入一些类型，而不是我们自己的模块，并且只需要对我们的代码进行五个小的改动！
+
+你不仅复制了 mio 的功能，而且几乎也知道了如何使用 mio 来创建一个事件循环！
+
+总结
+epoll、kqueue 和 IOCP 的概念在高层面上非常简单，但魔鬼藏在细节中。要正确理解并使其工作并不容易。即使是从事这些工作的程序员也通常会专攻一个平台（epoll/kqueue 或 Windows）。很少有人会了解所有平台的所有细节，你甚至可以单独写一整本书来讨论这个主题。
+
+如果我们总结一下你在本章中学到并亲身体验到的内容，这个列表相当令人印象深刻：
+
+你学到了很多关于 mio 是如何设计的，使你能够更容易地进入代码库并知道该寻找什么，以及如何开始阅读代码。
+你学到了很多关于在 Linux 上进行系统调用的知识。
+你创建了一个 epoll 实例，注册了事件并处理了这些事件。
+你学到了很多关于 epoll 的设计及其 API 的知识。
+你了解了边缘触发和水平触发，这些是非常底层的概念，但在 epoll 之外的上下文中也非常有用。
+你发出了一个原始的 HTTP 请求。
+你看到了非阻塞套接字的行为方式，以及操作系统报告的错误代码如何传达某些你应处理的条件。
+你通过查看 DNS 解析和文件 I/O，了解到并非所有 I/O 都是“阻塞”的。
+对于一个章节来说，这已经相当不错了！
+
+如果你深入研究我们在这里讨论的主题，你很快就会意识到到处都是陷阱和深坑——尤其是如果你将这个例子扩展到抽象 epoll、kqueue 和 IOCP。你可能最终会在不知不觉中阅读 Linus Torvalds 关于边缘触发模式在管道上应该如何工作的电子邮件。
+
+至少你现在有了进一步探索的良好基础。你可以扩展我们的简单示例，创建一个适当的事件循环来处理连接、写入、超时和调度；你可以深入研究 kqueue 和 IOCP，看看 mio 是如何解决这个问题的；或者你可以庆幸自己不必再直接处理这些问题，并欣赏像 mio、polling 和 libuv 这样的库所付出的努力。
+
+到这个时候，我们已经获得了关于异步编程基本构建模块的很多知识，所以是时候开始探索不同的编程语言如何创建异步操作的抽象，并使用这些构建模块为我们程序员提供高效、表达力强且富有成效的方式来编写异步程序了。
+
+首先是我最喜欢的一个例子，我们将通过自己实现纤程（或绿色线程）来了解它们的工作原理。
+
+你现在可以休息一下了
+是的，继续吧，下一章可以等一等。去喝杯茶或咖啡，放松一下，这样你可以以清醒的头脑开始下一章。我保证它会既有趣又有意思。
+
+
 
 
     
