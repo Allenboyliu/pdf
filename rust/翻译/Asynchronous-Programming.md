@@ -4801,3 +4801,1442 @@ coroutine fn async_main() {
 不过，在这一章结束后你绝对值得休息一下，所以去透透气，睡一觉，清空你的思绪，喝杯咖啡，然后再进入本书的最后部分。
 
 
+
+
+# 9.协程、自引用结构体与固定
+
+在这一章中，我们将通过增加在状态变化之间存储变量的能力来改进我们的协程。我们将看到这如何导致我们的协程需要引用自身，并由此产生的问题。专门为这个主题撰写整整一章的原因是，这是在 Rust 中使 async/await 工作的一个重要部分，也是一个相对难以理解的主题。
+
+造成这种情况的原因在于，固定的整个概念对许多开发者来说是陌生的，就像 Rust 的所有权系统一样，建立一个良好且有效的心理模型需要一些时间。幸运的是，固定的概念并不难理解，但它在语言中的实现方式以及如何与 Rust 的类型系统交互则是抽象且难以把握的。
+
+虽然我们在这一章中不会覆盖有关固定的所有内容，但我们会尽量对此有一个良好且合理的理解。这里的主要目标是对该主题感到自信，理解我们为什么需要它以及如何使用它。
+
+如前所述，这一章不仅仅是关于 Rust 中的固定，因此我们将首先进行一些重要的改进，继续完善第八章的最后示例。然后，我们将解释什么是自引用结构体，以及它们如何与 futures 相关联，最后说明固定如何解决我们的问题。
+
+本章将涵盖以下主要主题
+
+改进我们的示例 1 – 变量
+改进我们的示例 2 – 引用
+改进我们的示例 3 – 这…不是…好事…
+发现自引用结构体
+Rust 中的固定
+改进我们的示例 4 – 固定来救援
+技术要求
+
+本章的示例将基于上一章的代码，因此要求是相同的。所有示例都是跨平台的，并在 Rust（Rust平台支持）和 mio（mio平台支持）支持的所有平台上工作。您需要的唯一内容是安装 Rust 并将本书的 GitHub 存储库下载到本地。所有本章代码可在 ch09 文件夹中找到。
+
+为了逐步跟随示例，您还需要在计算机上安装 corofy。如果您在第七章中没有安装，您可以现在进入存储库中的 ch07/corofy 文件夹并运行以下命令：cargo install --force --path .。我们还将在本示例中使用 delayserver，因此您需要打开一个单独的终端，进入存储库根目录下的 delayserver 文件夹，并运行 cargo run，以便它为后续示例做好准备。
+
+如果您必须更改 delayserver 监听的端口，请记得在代码中更改端口号。
+
+改进我们的示例 1 – 变量
+
+那么，让我们回顾一下目前的情况，从上一章我们停下的地方继续。我们有以下内容：
+
+一个 Future 特征
+一个使用协程/等待语法和预处理器的协程实现
+一个基于 mio::Poll 的反应器
+一个允许我们生成任意数量顶层任务并调度准备运行的任务的执行器
+一个仅向我们的本地 delayserver 实例发起 HTTP GET 请求的 HTTP 客户端
+这并不算太糟糕——我们可能会说我们的 HTTP 客户端有些限制，但这不是本书的重点，因此我们可以接受这一点。然而，我们的协程实现严重有限。让我们看看如何让我们的协程稍微更有用。
+
+我们当前实现的最大缺点是，没有任何东西——我指的是真正的没有东西——能够跨越等待点存活。首先解决这个问题是有意义的。
+
+让我们开始设置我们的示例。
+
+我们将使用第八章（我们示例的最后版本）中的 d-multiple-threads 示例的“库”代码，但我们将通过添加一个更短和更简单的
+
+
+设置基本示例
+
+注意：您可以在本书的 GitHub 仓库中找到此示例，路径为 ch09/a-coroutines-variables。请执行以下步骤：
+
+创建一个名为 a-coroutines-variables 的文件夹。
+进入该文件夹并运行 cargo init。
+删除默认的 main.rs 文件，并将 ch08/d-multiple-threads/src 文件夹中的所有内容复制到 ch10/a-coroutines-variables/src 文件夹中。
+打开 Cargo.toml，并在依赖项部分添加对 mio 的依赖：
+toml
+mio = {version = "0.8", features = ["net", "os-poll"]}
+现在您的文件夹结构应该如下所示：
+
+src
+  ├── runtime
+  │     ├── executor.rs
+  │     └── reactor.rs
+  ├── future.rs
+  ├── http.rs
+  ├── main.rs
+  └── runtime.rs
+我们将最后一次使用 corofy 为我们生成样板状态机。将以下内容复制到 main.rs 中：
+
+
+mod future; 
+mod http; 
+mod runtime; 
+
+use crate::http::Http; 
+use future::{Future, PollState}; 
+use runtime::Waker; 
+
+fn main() {     
+    let mut executor = runtime::init();     
+    executor.block_on(async_main()); 
+} 
+
+coroutine fn async_main() {     
+    println!("程序开始");     
+    let txt = Http::get("/600/HelloAsyncAwait").wait;     
+    println!("{txt}");     
+    let txt = Http::get("/400/HelloAsyncAwait").wait;     
+    println!("{txt}"); 
+}
+这一次，让我们走捷径，将我们的协程文件直接回写到 main.rs 中，因为到目前为止我们已经多次并排比较了文件。假设您在基本文件夹 a-coroutine-variables 中，写下以下内容：
+
+corofy ./src/main.rs ./src/main.rs
+最后一步是修复 corofy 不知道 Waker 的问题。您可以通过写 cargo check 让编译器指导您需要更改的地方，但为了帮助您，有三个小修改需要做（请注意，行号是重新编写之前我们所写代码时报告的行号）：
+
+64: fn poll(&mut self, waker: &Waker) 
+82: match f1.poll(waker) 
+102: match f2.poll(waker)
+现在，通过写 cargo run 检查一切是否按预期工作。您应该看到以下输出（输出已被简略，以节省一点空间）：
+
+程序开始 
+第一次投票 - 启动操作 
+主：1 个挂起任务。睡眠直到收到通知。 
+HTTP/1.1 200 OK 
+[==== 简略 ====] 
+HelloAsyncAwait 
+主：所有任务都已完成
+注意： 请记住，我们需要在终端窗口中运行 delayserver，以便响应我们的 HTTP GET 请求。有关更多信息，请参见技术要求部分。
+
+现在我们已经处理完了模板，是时候开始进行我们讨论过的改进了。
+
+我们希望看看如何改进我们的状态机，以便它能够在等待点之间保持变量。为此，我们需要将它们存储在某个地方，并在进入状态机中的每个状态时恢复所需的变量。
+
+提示
+假装这些重写是由 corofy（或编译器）完成的。尽管 corofy 无法执行这些重写，但也可以自动化此过程。
+
+我们的协程/等待程序看起来是这样的：
+
+coroutine fn async_main() {     
+    println!("程序开始");     
+    let txt = Http::get("/600/HelloAsyncAwait").wait;     
+    println!("{txt}");     
+    let txt = Http::get("/400/HelloAsyncAwait").wait;     
+    println!("{txt}"); 
+}
+我们希望将其更改为如下所示：
+
+coroutine fn async_main() {     
+    let mut counter = 0;     
+    println!("程序开始");     
+    let txt = http::Http::get("/600/HelloAsyncAwait").wait;     
+    println!("{txt}");     
+    counter += 1;     
+    let txt = http::Http::get("/400/HelloAsyncAwait").wait;     
+    println!("{txt}");     
+    counter += 1;     
+    println!("收到 {} 个响应。", counter); 
+}
+在这个版本中，我们在 async_main 函数的顶部简单地创建一个计数器变量，并在每次从服务器接收到响应时增加计数器。最后，我们输出我们收到的响应数量。
+
+注意
+为简洁起见，我在接下来的内容中不会展示整个代码库；相反，我只会显示相关的补充和更改。请记住，您始终可以参考本书 GitHub 仓库中的相同示例。
+
+我们实现这个的方式是向 Coroutine0 结构体添加一个名为 stack 的新字段：
+
+struct Coroutine0 {     
+    stack: Stack0,     
+    state: State0, 
+}
+stack 字段保存一个我们也需要定义的 Stack0 结构体。
+
+
+#[derive(Default)]
+struct Stack0 {
+    counter: Option<usize>,
+}
+这个结构体将只持有一个字段，因为我们只有一个变量。该字段的类型为 Option<usize>。我们还为这个结构体派生了 Default 特征，以便我们可以轻松地初始化它。
+
+注意
+Rust 中使用 async/await 创建的 Futures 以稍微更有效的方式存储这些数据。在我们的示例中，我们将每个变量存储在一个单独的结构体中，因为我认为这样更容易推理，但这也意味着我们需要存储的变量越多，我们的协程所需的空间就越大。随着需要在状态变化之间存储/恢复的不同变量数量的增加，空间将线性增长。这可能会是大量数据。例如，如果我们有 100 个状态变化，每个状态变化都需要一个独特的 i64 大小的变量存储到下一个状态，这将需要一个占用 
+100
+×
+8
+b
+=
+800
+100×8b=800 字节内存的结构体。
+
+Rust 通过将协程实现为枚举来优化这一点，其中每个状态仅保存其在下一个状态中需要恢复的数据。这样，协程的大小并不依赖于变量的总数，而只依赖于需要保存/恢复的最大状态的大小。在前面的示例中，大小将减少到 8 字节，因为任何单个状态变化所需的最大空间足以存储一个 i64 类型的变量。相同的空间将被重复使用。
+
+这一设计允许这种优化是显著的，并且在内存效率方面，无栈协程相较于有栈协程具有优势。
+
+接下来，我们需要更改 Coroutine0 上的 new 方法：
+
+impl Coroutine0 {
+    fn new() -> Self {
+        Self {
+            state: State0::Start,
+            stack: Stack0::default(),
+        }
+    }
+}
+stack 的默认值对我们并不相关，因为我们反正会覆盖它。
+
+接下来的几个步骤是我们最感兴趣的。在 Coroutine0 的 Future 实现中，我们将假装 corofy 添加了以下代码来初始化、存储和恢复堆栈变量。让我们看看在第一次调用 poll 时会发生什么：
+
+
+State0::Start => {
+    // 初始化堆栈（提升变量）
+    self.stack.counter = Some(0);
+    // ---- 你实际写的代码 ----
+    println!("程序启动");
+    // ---------------------------------
+    let fut1 = Box::new(http::Http::get("/600/HelloAsyncAwait"));
+    self.state = State0::Wait1(fut1);
+    // 保存堆栈
+}
+好的，这里有一些重要的更改，我已经突出显示。让我们逐一查看它们：
+
+在我们处于 Start 状态时，我们首先在顶部添加一个段落来初始化我们的堆栈。我们所做的一件事是把所有相关代码段（在这种情况下，是在第一个等待点之前）的变量声明提升到函数的顶部。
+
+在我们的示例中，我们还将变量初始化为它们的初始值，在这种情况下为 0。
+
+我们还添加了一条注释，说明我们应该保存堆栈，但由于在第一个等待点之前发生的所有事情都是对 counter 的初始化，因此这里没有任何东西可以存储。
+
+让我们看看在第一个等待点之后发生了什么：
+
+State0::Wait1(ref mut f1) => {
+    match f1.poll(waker) {
+        PollState::Ready(txt) => {
+            // 恢复堆栈
+            let mut counter = self.stack.counter.take().unwrap();
+            // ---- 你实际写的代码 ----
+            println!("{txt}");
+            counter += 1;
+            // ---------------------------------
+            let fut2 = Box::new(http::Http::get("/400/HelloAsyncAwait"));
+            self.state = State0::Wait2(fut2);
+            // 保存堆栈
+            self.stack.counter = Some(counter);
+        }
+        PollState::NotReady => break PollState::NotReady,
+    }
+}
+嗯，这很有趣。我已经强调了我们需要做的更改。
+
+我们首先恢复堆栈，通过获取 counter 的所有权（take() 在这种情况下将当前存储在 self.stack.counter 中的值替换为 None），并将其写入一个具有相同名称的变量（counter）。在这种情况下，获取所有权并稍后将值放回并不是一个问题，它模仿了我们在协程/等待示例中编写的代码。
+
+下一个更改只是将所有代码段粘贴在第一个等待点之后。在这种情况下，唯一的更改是将 counter 变量增加 1。
+
+最后，我们将堆栈状态保存回来，以便在等待点之间保持更新的状态。
+
+注意
+在第 5 章中，我们看到我们需要存储/恢复纤程中的寄存器状态。由于第 5 章展示了一个有栈协程实现的示例，我们完全不必担心堆栈状态，因为所需的所有状态都存储在我们创建的堆栈中。
+
+由于我们的协程是无栈的，我们并不是为每个协程存储整个调用栈，而是需要存储/恢复将在等待点之间使用的堆栈部分。无栈协程仍然需要从堆栈保存一些信息，就像我们在这里所做的那样。
+
+当我们进入 State0::Wait2 状态时，我们以相同的方式开始：
+
+
+state0::Wait2(ref mut f2) => {
+    match f2.poll(waker) {
+        PollState::Ready(txt) => {
+            // 恢复堆栈
+            let mut counter = self.stack.counter.take().unwrap();
+            // ---- 你实际写的代码 ----
+            println!("{txt}");
+            counter += 1;
+            println!("收到 {} 个响应。", counter);
+            // ---------------------------------
+            self.state = State0::Resolved;
+            // 保存堆栈（所有变量已经设置为 None）
+            break PollState::Ready(String::new());
+        }
+        PollState::NotReady => break PollState::NotReady,
+    }
+}
+由于我们的程序中没有更多的等待点，因此其余代码进入这个代码段，并且由于在这一点上我们不再需要 counter ，我们可以简单地通过让它超出作用域来丢弃它。如果我们的变量持有任何资源，它们也将在这里释放。
+
+通过这一点，我们让我们的协程具备了在等待点之间保存变量的能力。让我们尝试通过运行 cargo run 来执行它。
+
+你应该会看到以下输出（我已删除未改变的输出部分）：
+
+… HelloAsyncAwait 收到 2 个响应。
+main: 所有任务都已完成
+好的，我们的程序工作正常并且符合预期。太好了！
+
+现在，让我们看看一个需要在等待点之间存储引用的例子，因为这是让我们的协程/等待函数表现得像“正常”函数的重要方面。
+
+改进我们的例子 2 - 引用
+
+让我们为这个例子的下一个版本做好准备：
+
+创建一个名为 b-coroutines-references 的新文件夹，并将 a-coroutines-variables 中的所有内容复制到其中。
+你可以通过更改 Cargo.toml 中包的 name 属性来更改项目名称，以使其与文件夹对应，但这不是使示例正常工作所必需的。
+注意 你可以在本书的 GitHub 仓库的 ch10/b-coroutines-references 文件夹中找到这个示例。
+
+这一次，我们将学习如何在我们的协程中存储对变量的引用，使用以下协程/等待示例程序：
+
+use std::fmt::Write;
+
+coroutine fn async_main() {
+    let mut buffer = String::from("\nBUFFER:\n----\n");
+    let writer = &mut buffer;
+    println!("程序启动");
+    let txt = http::Http::get("/600/HelloAsyncAwait").wait;
+    writeln!(writer, "{txt}").unwrap();
+    let txt = http::Http::get("/400/HelloAsyncAwait").wait;
+    writeln!(writer, "{txt}").unwrap();
+    println!("{}", buffer);
+}
+因此，在这个例子中，我们创建了一个 String 类型的 buffer 变量并用一些文本初始化它，然后我们获取一个对它的 &mut 引用并将其存储在一个 writer 变量中。
+
+
+每次我们收到一个响应时，我们都会通过我们在 writer 中持有的 &mut 引用将响应写入缓冲区，然后在程序结束时将缓冲区打印到终端。
+
+让我们看看我们需要做些什么来使其工作。我们首先需要引入 fmt::Write 特性，以便能够使用 writeln! 宏将内容写入缓冲区。将其添加到 main.rs 的顶部：
+
+ch09/b-coroutines-references/src/main.rs
+use std::fmt::Write;
+接下来，我们需要更改我们的 Stack0 结构，以便它表示我们必须在更新示例中的等待点之间存储的内容：
+
+ch09/b-coroutines-references/src/main.rs
+#[derive(Default)]
+struct Stack0 {
+    buffer: Option<String>,
+    writer: Option<*mut String>,
+}
+这里要注意的一点是，writer 不能是 Option<&mut String>，因为我们知道它将引用同一结构中的 buffer 字段。包含对 &self 引用的字段的结构称为自引用结构，在 Rust 中无法表示自引用的生存期。因此，解决方案是将 &mut 自引用转换为指针，并确保我们自己正确管理生命周期。
+
+我们需要更改的唯一其他内容是 Future::poll 的实现：
+
+ch09/b-coroutines-references/src/main.rs
+State0::Start => {
+    // 初始化堆栈（提升变量）
+    self.stack.buffer = Some(String::from("\nBUFFER:\n----\n"));
+    self.stack.writer = Some(self.stack.buffer.as_mut().unwrap());
+    // ---- 你实际写的代码 ----
+    println!("程序启动");
+    // ---------------------------------
+    let fut1 = Box::new(http::Http::get("/600/HelloAsyncAwait"));
+    self.state = State0::Wait1(fut1);
+    // 保存堆栈
+}
+好的，这看起来有点奇怪。我们更改的第一行很简单。我们将 buffer 变量初始化为一个新的 String 类型，正如我们在协程/等待程序的开头所做的那样。但是，下一行看起来有点危险。
+
+
+注意
+
+将引用转换为指针是安全的。危险的部分在于解引用该指针。
+
+接下来，我们添加一行代码来写入响应。我们可以保持与在协程/等待函数中相同的写法。
+
+最后，我们将堆栈状态保存回来，因为我们需要两个变量在等待点之间持续存在。
+
+注意
+
+在使用 writer 字段中存储的指针时，我们不必占有该指针，因为我们可以简单地复制它，但为了保持一致性，我们选择占有它，就像我们在第一个例子中所做的那样。这也是合理的，因为如果不需要在下一个等待点存储该指针，我们可以通过不把它存回去而让它超出作用域。
+
+最后一部分是当我们到达 Wait2 并且我们的未来返回 PollState::Ready 时：
+
+State0::Wait2(ref mut f2) => {
+    match f2.poll(waker) {
+        PollState::Ready(txt) => {
+            // 恢复堆栈
+            let buffer = self.stack.buffer.as_ref().take().unwrap();
+            let writer = unsafe { &mut *self.stack.writer.take().unwrap() };
+            // ---- 你实际写的代码 ----
+            writeln!(writer, "{}", txt).unwrap();
+            println!("{}", buffer);
+            // ---------------------------------
+            self.state = State0::Resolved; // 保存堆栈 / 释放资源
+            let _ = self.stack.buffer.take();
+            break PollState::Ready(String::new());
+        }
+        PollState::NotReady => break PollState::NotReady,
+    }
+}
+在这一段中，我们恢复了两个变量，因为我们通过 writer 变量写入最后的响应，然后将保存在缓冲区中的所有内容打印到终端。
+
+我想指出的是，println!("{}", buffer); 这一行在原始的协程/等待示例中接受了一个引用，尽管它看起来像是我们传递了一个拥有的 String。因此，我们将缓冲区恢复为 &String 类型而不是拥有的版本是有道理的。转移所有权也会使 writer 变量中的指针无效。
+
+我们做的最后一件事是丢弃我们不再需要的数据。我们的 self.stack.writer 字段已经设置为 None，因为在恢复堆栈时我们占有了它，但我们还需要占有 self.stack.buffer 持有的 String 类型，这样它也会在该作用域结束时被丢弃。如果不这样做，我们将继续占有分配给 String 的内存，直到整个协程被丢弃（这可能会晚得多）。
+
+现在，我们已经完成了所有的更改。如果我们之前所做的重写在 corofy 中实现，那么在理论上，我们的协程/等待实现可以支持更复杂的用例。
+
+
+
+让我们看看运行程序时会发生什么，使用命令 cargo run：
+
+程序启动 第一次轮询 - 开始操作
+
+main: 1 个待处理任务。睡眠，直到收到通知。
+第一次轮询 - 开始操作
+main: 1 个待处理任务。睡眠，直到收到通知。
+缓冲区：
+----
+HTTP/1.1 200 OK
+content-length: 15
+connection: close
+content-type: text/plain; charset=utf-8
+date: Thu, 30 Nov 2023 22:48:11 GMT
+HelloAsyncAwait
+HTTP/1.1 200 OK
+content-length: 15
+connection: close
+content-type: text/plain; charset=utf-8
+date: Thu, 30 Nov 2023 22:48:11 GMT
+HelloAsyncAwait
+main: 所有任务已完成。
+哇，太好了。所有那些危险的不安全操作都成功工作了，是吧？干得好。在结束之前，让我们做一个小小的改进。
+
+**改进我们的示例 3 – 这实在是……不……好……**
+
+假装你没读过这个部分标题，享受我们之前的示例编译并显示正确结果的事实。
+
+我认为我们的协程实现现在如此出色，以至于我们可以看看一些优化。而且，特别是我想立即对我们的执行器进行一个优化。
+
+在我们开始之前，让我们先准备好一切：
+1. 创建一个名为 `c-coroutines-problem` 的新文件夹，并将 `b-coroutines-references` 中的所有内容复制到它；
+2. 你可以通过在 `Cargo.toml` 中的 `package` 部分更改 `name` 属性来更改项目名称，以便它与文件夹相对应，但这不是使示例正常工作的必要条件。
+
+**提示**：这个示例位于本书的 GitHub 仓库中的 `ch09/c-coroutines-problem` 文件夹内。
+
+一切准备就绪后，回到优化上。你看，我们对我们运行时将在现实生活中处理的工作负载的新见解表明，大多数 future 在第一次轮询时将返回 `Ready`。因此，理论上，我们只需在 `block_on` 中对接收到的 future 进行一次轮询，它大多数时候就会立即解决。
+
+让我们导航到 `src/runtime/executor.rs`，看看我们如何通过添加几行代码来利用这一点。
+
+如果你导航到我们的 `Executor::block_on` 函数，你会看到我们首先做的是在轮询之前生成 future。生成 future 意味着我们在堆中分配空间并将其位置的指针存储在一个 HashMap 变量中。
+
+由于 future 很可能在第一次轮询时返回 `Ready`，因此这是一项不必要的工作，可以避免。让我们在 `block_on` 函数的开头添加这个小优化，以便利用这一点。
+
+---
+
+如果需要进一步的翻译或有其他问题，请告诉我！
+
+
+pub fn block_on<F>(&mut self, future: F)
+where
+    F: Future<Output = String> + 'static,
+{
+    // ===== 优化，假设已准备好
+    let waker = self.get_waker(usize::MAX);
+    let mut future = future;
+    match future.poll(&waker) {
+        PollState::NotReady => (),
+        PollState::Ready(_) => return,
+    }
+    // ===== 结束
+    spawn(future);
+    loop {
+        // 现在，我们立即轮询未来，如果未来在第一次轮询时得到解决，我们就返回，因为一切都完成了。这样，我们只在需要等待的情况下生成 future。
+        // 是的，这假设我们从未达到 usize::MAX 作为我们的 ID，但让我们假装这只是一个概念证明。
+        // 如果 future 被生成并再次轮询，我们的 Waker 将会被舍弃并被一个新的 Waker 替换，所以这不应该是个问题。
+        
+        // 尝试运行我们的程序，看看我们得到了什么：
+        // 程序启动
+        // 第一次轮询 - 开始操作
+        // main: 1 个待处理任务。睡眠，直到收到通知。
+        // 第一次轮询 - 开始操作
+        // main: 1 个待处理任务。睡眠，直到收到通知。
+        // /400/HelloAsyn 
+        // free(): 检测到 tcache 2 中的双重释放
+        // 中止
+        // 等等，什么？！那听起来不好！好吧，这可能是 Linux 中的内核错误，所以让我们尝试在 Windows 上运行：
+        // ... 错误：进程未成功退出： `target\release\c-coroutines-problem.exe`（退出代码：0xc0000374，状态：堆损坏）
+        // 听起来更糟了！到底发生了什么？
+
+        // 让我们更仔细地看看我们的小优化在我们的异步系统中究竟发生了什么。
+        // 发现自引用结构体
+        // 发生的事情是我们创建了一个自引用结构体，初始化它以获取其自身的指针，然后将其移动。让我们深入了解一下。
+
+首先，我们将一个 future 对象作为参数传递给 block_on。这没有问题，因为这个 future 还不是自引用的，因此我们可以在任何地方自由移动它（这也是为什么在轮询之前移动 futures 是完全可以接受的，使用适当的 async/await）。
+
+接下来，我们对这个 future 进行了第一次轮询。我们所做的优化进行了一个重要的改变。当我们第一次轮询时，future 位于栈上（在 block_on 函数的栈帧中）。
+
+当我们第一次轮询 future 时，我们把变量初始化为它们的初始状态。我们的 writer 变量此时获取了指向 buffer 变量的指针（buffer 变量作为我们协程的一部分存储），并使其成为自引用的。
+
+第一次轮询 future 时，它返回了 NotReady。
+
+由于它返回了 NotReady，我们生成了 future，这将其移动到任务集合中，集合的类型为 HashMap<usize, Box<dyn Future<Output = String>>> 在我们的 Executor 中。现在，future 被放置在 Box 中，这将其移动到堆上。
+
+当我们下次轮询这个 future 时，我们通过解引用我们为 writer 变量持有的指针来恢复栈。然而，有一个大问题：这个指针现在指向的是第一次轮询时 future 在栈上旧位置。
+
+这不会有好的结果，在我们的例子中也是如此。你现在已经亲眼见证了自引用结构体的问题，以及它是如何应用于 futures 的，为什么我们需要一些东西来防止这种情况的发生。自引用结构体是指一个结构体引用自身并将其存储在一个字段中。不过，这里的“引用”一词有点不准确，因为在 Rust 中没有办法直接对自身进行引用并将该引用存储在自身。要在安全的 Rust 中做到这一点，你必须将引用转换为指针（记住，引用只是编程语言中的一种特殊指针）。
+
+注意
+当我们在本章创建可视化时，我们将忽略填充，即使我们知道结构体在字段之间可能会有一些填充，正如我们在第 4 章讨论的那样。当这个值移动到内存的另一个位置时，指针不会更新，仍然指向“旧”的位置。
+
+如果我们查看从栈上的一个位置移动到另一个位置的情况，它看起来像这样。
+图 9.1 – 移动自引用结构体
+
+在前面的图中，左侧可以看到内存地址，旁边是栈的表示。由于在值移动时指针没有更新，因此它现在指向的是旧位置，这可能会造成严重问题。
+
+注意
+这些问题很难被检测到，而且创建简单的示例以表明这样的移动导致严重问题是相当困难的。原因在于，即使我们移动了所有东西，旧值不会立即被置零或覆盖。通常，它们仍然在那里，因此解引用之前的指针可能会产生正确的值。问题仅在于当你在新位置更改 x 的值并期望 y 指向它时才会出现。在这种情况下，解引用 y 仍然会产生一个有效的值，但这是错误的值。
+
+优化构建通常会消除不必要的移动，这可能导致错误更难被检测到，因为大多数程序看起来都正常运作，尽管它们含有严重的错误。
+
+什么是移动？
+在 Rust 中，移动是许多来自如 C#、JavaScript 和类似垃圾回收语言的程序员不熟悉的概念，与 C 和 C++ 程序员所习惯的不同。Rust 中移动的定义与其所有权系统密切相关。
+
+移动意味着转移所有权。在 Rust 中，移动是传递值的默认方式，每当你改变一个对象的所有权时就会发生移动。如果你移动的对象仅由复制类型（实现了 Copy trait 的类型）组成，那么这就像是将数据简单地复制到栈上的新位置。
+
+对于非复制类型，移动会将它包含的所有复制类型一并复制，正如在第一个示例中所示，但这次它还会复制指向资源（如堆分配）的指针。被移动对象将变得无法访问（例如，如果你尝试使用被移动的对象，编译将失败，并告知该对象已经移动），因此在任何时刻只有一个所有者与该分配相关。
+
+与克隆（cloning）不同，移动不会重新创建任何资源，也不会创建它们的克隆。还有一件重要的事情是，编译器确保在被移动的对象上永远不会调用 drop，以便释放资源的唯一方式是新的对象接管了所有权。
+
+图 9.2 提供了移动、克隆和复制之间区别的简化视觉概览（我们在本可视化中排除了结构体的任何内部填充）。在这里，我们假设有一个结构体，包含两个字段——一个是复制类型的 a，类型为 i64，另一个是非复制类型的 b，类型为 Vec。
+
+
+
+图 9.2 – 移动、克隆和复制
+
+移动在许多方面类似于我们结构体中位于栈上的所有内容的深复制。当你有指向自身的指针（如自引用结构体那样）时，这会构成问题，因为在移动之后，自身将会在新的内存地址开始，但指向自身的指针不会被调整以反映这一变化。
+
+在编写 Rust 时，你可能不会太多考虑移动，因为这是语言的一部分，你从未明确使用过，但了解它是什么以及它的作用是很重要的。
+
+现在我们已经对问题有了良好的理解，让我们更仔细地看看 Rust 是如何通过其类型系统来解决这个问题，以防止我们移动依赖于稳定内存位置才能正确运行的结构体。
+
+Rust 中的固定
+
+以下图表显示了一个稍微复杂一些的自引用结构体，以便我们有可视化的内容来帮助我们理解：
+
+
+图 9.3 – 移动一个具有三个字段的自引用结构体
+
+在高层次上，固定（pinning）使得能够依赖于具有稳定内存地址的数据，通过禁止任何可能移动它的操作。
+
+
+图 9.4 – 移动一个固定（pinned）结构体
+
+固定（pinning）的概念很简单。复杂的部分是它在语言中的实现方式以及如何使用它。
+
+理论中的固定（Pinning）
+固定是 Rust 标准库的一部分，由两个部分组成：类型 Pin 和标记特征 Unpin。固定仅仅是语言构造。并没有特殊的存储位置或内存可以将值移动到，以便使其被固定。也没有系统调用可以请求操作系统确保一个值在内存中保持不变。它只是类型系统的一部分，旨在防止我们能够移动一个值。
+
+Pin 并没有消除对不安全（unsafe）的需求——它只是为不安全的使用者提供了一个保证，确保值在内存中具有稳定的位置，只要固定值的用户只使用安全的 Rust。这使我们能够编写安全的自引用类型。它确保所有可能导致问题的操作必须使用不安全的代码。
+
+回到我们的协程示例，如果我们要移动结构体，就必须编写不安全的 Rust。这就是 Rust 如何保持其安全保证的方式。如果你以某种方式知道你创建的未来永远不会进行自引用，你可以选择使用不安全代码来移动它，但如果你出错，责任将落在你身上。
+
+在进一步探讨固定之前，我们需要定义一些今后需要理解的术语。
+
+定义
+以下是我们必须理解的定义：
+
+Pin 是所有关注的类型。你会在 Rust 标准库的 std::pin 模块中找到它。Pin 封装实现了 Deref 特征的类型，从实用角度来看，这意味着它封装了引用和智能指针。
+
+Unpin 是一个标记特征。如果某个类型实现了 Unpin，固定将对该类型没有影响。你没有看错——没有影响。该类型仍将被封装在 Pin 中，但你可以简单地将其取出。
+
+给人印象深刻的是，几乎所有东西默认都实现了 Unpin，如果你手动想要将一个类型标记为 !Unpin，你必须向你的类型添加一个名为 PhantomPinned 的标记特征。
+
+使类型 T 实现 !Unpin 是 Pin<&mut T> 对某种东西产生影响的唯一方式。
+
+固定一个 !Unpin 类型将保证该值在内存中保持在同一个位置，直到它被丢弃，只要你保持在安全的 Rust 中。
+
+Pin 投影 是一个类型上的辅助方法，它是固定的。语法通常有点奇怪，因为它们仅在自身的固定实例上有效。例如，它们通常看起来像 fn foo(self: Pin<&mut self>)。
+
+结构性固定 与投影有关，如果你有 Pin<&mut T>，其中 T 具有一个可以自由移动的字段 a 和一个不能移动的字段 b，你可以进行如下操作：
+
+为 a 编写一个投影，使用 fn a(self: Pin<&mut self>) -> &A 的签名。在这个情况下，我们说固定不是结构性的。
+
+为 b 编写一个投影，形如 fn b(self: Pin<&mut self>) -> Pin<&mut B>，在这种情况下，我们说 b 是结构性固定，因为它在结构体 T 被固定时也被固定。
+
+
+将值固定到堆上
+
+注意：我们在这里展示的小代码片段可以在本书的 GitHub 仓库中的 ch09/d-pin 文件夹找到。不同的示例作为不同的方法实现，你可以在主函数中进行注释或取消注释。
+
+让我们写一个小例子来说明固定值的不同方式：
+
+use std::{marker::PhantomPinned, pin::Pin};
+
+#[derive(Default)]
+struct Foo {
+    a: MaybeSelfRef,
+    b: String,
+}
+因此，我们希望能够使用 MaybeSelfRef::default() 创建一个实例，我们可以随意移动它，但在某个时候将其初始化为引用自身的状态；移动它会导致问题。
+
+这很像在我们之前的例子中看到的，直到轮询时才是自引用的 futures。让我们为 MaybeSelfRef 编写实现块，并查看代码。
+
+
+impl MaybeSelfRef {
+    fn init(self: Pin<&mut Self>) {
+        unsafe {
+            let Self { a, b, .. } = self.get_unchecked_mut();
+            *b = Some(a);
+        }
+    }
+
+    fn b(self: Pin<&mut Self>) -> Option<&mut usize> {
+        unsafe { self.get_unchecked_mut().b.map(|b| &mut *b) }
+    }
+}
+正如你所看到的，只有在我们调用 init 方法后，MaybeSelfRef 才会是自引用的。我们还定义了一个方法，将存储在 b 中的指针转换为 Option<&mut usize>，也就是对 a 的可变引用。
+
+需要注意的是，我们的两个函数都需要 unsafe。如果没有使用 Pin，那么唯一需要 unsafe 的方法是 b，因为我们在那里解引用了一个指针。获取一个固定值的可变引用总是需要 unsafe，因为在那时没有任何东西可以阻止我们移动这个固定值。
+
+在堆上固定通常是通过固定一个 Box 来实现的。Box 上甚至有一个方便的方法，让我们可以得到 Pin<Box<...>>。让我们看一个简短的例子：
+
+fn main() {
+    let mut x = Box::pin(MaybeSelfRef::default());
+    x.as_mut().init();
+    println!("{}", x.as_ref().a);
+    *x.as_mut().b().unwrap() = 2;
+    println!("{}", x.as_ref().a);
+}
+在这里，我们把 MaybeSelfRef 固定到堆上并对其进行初始化。我们打印 a 的值，然后通过 b 中的自引用修改数据，并将其值设置为 2。查看输出时，我们会发现一切都如预期那样：
+
+Finished dev [unoptimized + debuginfo] target(s) in 0.56s
+Running `target\debug\x-pin-experiments.exe` 0 2
+固定的值永远不会移动，作为 MaybeSelfRef 的用户，我们不需要编写任何不安全的代码。Rust 可以保证我们永远不会（在安全的 Rust 中）获得对 MaybeSelfRef 的可变引用，因为 Box 拥有它。堆固定是安全的并不奇怪，因为与栈不同，堆分配在整个程序运行过程中会保持稳定，无论我们在哪里创建它。
+
+重要提示：这是在 Rust 中固定值的首选方法。栈固定用于那些没有堆可以使用或无法接受额外分配成本的情况。
+
+接下来我们来看一下栈固定。
+
+
+栈固定
+栈固定可能有些困难。在第5章中，我们看到栈是如何工作的，我们知道栈在值被弹出和推入时会增长和缩小。因此，如果我们要在栈上进行固定，我们必须在栈上某个“高”的位置进行固定。这意味着，如果我们在函数调用内部将一个值固定到栈上，我们不能从该函数返回，并期望该值仍然固定在那里。这是不可能的。
+
+栈固定很难，因为我们通过获取 &mut T 来进行固定，并且我们必须保证在 T 被释放之前不会移动它。如果我们不小心，这很容易出错。Rust 在这里无法帮助我们，所以我们需要自己维护这个保证。这就是为什么栈固定是不安全的。
+
+让我们看看使用栈固定的相同示例：
+
+fn stack_pinning_manual() {
+    let mut x = MaybeSelfRef::default();
+    let mut x = unsafe { Pin::new_unchecked(&mut x) };
+    x.as_mut().init();
+    println!("{}", x.as_ref().a);
+    *x.as_mut().b().unwrap() = 2;
+    println!("{}", x.as_ref().a);
+}
+这里显著的区别是，栈固定是不安全的，因此，现在我们作为 MaybeSelfRef 的用户和实现者都需要使用 unsafe。
+
+如果我们通过 cargo run 运行示例，输出将与我们第一个示例中的相同：
+
+Finished dev [unoptimized + debuginfo] target(s) in 0.58s
+Running `target\debug\x-pin-experiments.exe` 0 2
+栈固定需要 unsafe 的原因是，意外破坏 Pin 应提供的保证是相当容易的。让我们看这个示例：
+
+use std::mem::swap;
+
+fn stack_pinning_manual_problem() {
+    let mut x = MaybeSelfRef::default();
+    let mut y = MaybeSelfRef::default();
+    {
+        let mut x = unsafe { Pin::new_unchecked(&mut x) };
+        x.as_mut().init();
+        *x.as_mut().b().unwrap() = 2;
+    }
+    swap(&mut x, &mut y);
+    println!("      x: {{   +----->a: {:p},   |      b: {:?},   |  }}   |   |  y: {{   |      a: {:p},   +-----|b: {:?},      }}",
+        &x.a,
+        x.b,
+        &y.a,
+        y.b,
+    );
+}
+在这个示例中，我们创建了两个名为 x 和 y 的 MaybeSelfRef 实例。然后，我们创建一个作用域，在该作用域内固定 x 并通过解引用 b 中的自引用将 x.a 的值设置为2，正如我们之前所做的那样。
+
+现在，当我们离开作用域时，x 不再被固定，这意味着我们可以在不需要 unsafe 的情况下获取对它的可变引用。
+
+由于这是安全的 Rust，我们应该能够做我们想做的，于是我们交换 x 和 y。输出打印出两个结构体的 a 字段的指针地址和 b 中存储的指针值。
+
+当我们查看输出时，应该能立即看到问题。
+
+
+已完成 dev [未优化 + 调试信息] 目标在 0.58s 内
+正在运行 `target\debug\x-pin-experiments.exe` 
+x: {   +----->a: 0xe45fcff558,   |      b: None,   |  }   |   |  y: {   |      a: 0xe45fcff570,   +-----|b: Some(0xe45fcff558),      }
+虽然指针值在不同运行之间会有所不同，但很明显，y 不再持有指向自身的指针。此时它指向 x 的某个位置。这是非常糟糕的，并会导致 Rust 应该防止的内存安全问题。
+
+注意
+出于这个原因，标准库有一个 pin! 宏，它帮助我们实现安全的栈固定。该宏在底层使用 unsafe 但使我们无法再次访问已固定的值。
+
+现在我们已经看到了栈固定的所有陷阱，我明确建议在不需要使用它的情况下避免使用。如果你确实需要使用它，那么请使用 pin! 宏，以避免我们在这里描述的问题。
+
+提示
+在本书的 GitHub 仓库中，你会发现一个名为 stack_pinning_macro() 的函数，位于 ch09/d-pin/src/main.rs 文件中。这个函数展示了之前的示例，但使用了 Rust 的 pin! 宏。
+
+固定投影和结构固定
+在我们离开固定主题之前，我们将快速解释什么是固定投影和结构固定。虽然这听起来复杂，但实际上非常简单。以下图表显示了这些术语之间的联系。
+
+
+图 9.5 – 固定投影和结构固定
+结构固定意味著，如果一个结构体被固定，那么它的字段也会被固定。我们通过固定投影来暴露这一点，正如下面的代码示例所示。
+
+如果我们继续我们之前的例子并创建一个叫做 Foo 的结构体，该结构体同时包含 MaybeSelfRef（字段 a）和 String 类型（字段 b），我们可以编写两个投影，它们返回 a 的固定版本及 b 的常规可变引用：
+
+ch09/d-pin/src/main.rs     
+#[derive(Default)]     
+struct Foo {         
+    a: MaybeSelfRef,         
+    b: String,     
+}     
+
+impl Foo {         
+    fn a(self: Pin<&mut Self>) -> Pin<&mut MaybeSelfRef> {             
+        unsafe {                 
+            self.map_unchecked_mut(|s| &mut s.a)             
+        }         
+    }         
+
+    fn b(self: Pin<&mut Self>) -> &mut String {             
+        unsafe {                 
+            &mut self.get_unchecked_mut().b             
+        }         
+    }     
+}
+请注意，这些方法只有在 Foo 被固定时才能调用。您无法在一个普通的 Foo 实例上调用这两个方法。
+固定投影确实有一些微妙之处需要您注意，但在官方文档中对此进行了详细解释（Rust 官方文档），因此我会在这里推荐您查阅有关编写投影时必须采取的预防措施的更多信息。
+
+注意
+由于固定投影在创建时可能容易出错，有一个流行的用于生成固定投影的库，叫做 pin_project（pin_project 文档）。如果您需要创建固定投影，值得查看一下。
+
+这样一来，我们基本覆盖了 async Rust 中的所有高级主题。然而，在我们进入最后一章之前，让我们看看固定是如何防止我们在上一次协程示例中犯下大错误的。
+
+改进我们的示例 4 – 固定来解救
+幸运的是，我们需要进行的更改很小，但在继续进行更改之前，让我们创建一个新文件夹，并将我们在之前示例中拥有的所有内容复制到该文件夹中：
+复制整个 c-coroutines-problem 文件夹，并将新副本命名为 e-coroutines-pin
+打开 Cargo.toml 并将包的名称重命名为 e-coroutines-pin
+
+提示
+您会在本书的 GitHub 仓库中找到我们要在这里讨论的示例代码，位于 ch09/e-coroutines-pin 文件夹下。
+
+现在我们有了新的文件夹，让我们开始进行必要的更改。逻辑开始的位置是我们在 future.rs 中的 Future 定义。
+
+
+future.rs
+
+我们要做的第一件事是在最顶部引入标准库中的 Pin：
+
+ch09/e-coroutines-pin/src/future.rs
+use std::pin::Pin;
+我们需要进行的唯一其他更改是在 Future 特征中对 poll 的定义：
+
+fn poll(self: Pin<&mut Self>, waker: &Waker) -> PollState<Self::Output>;
+基本上就是这些。然而，这个更改的影响在调用 poll 的地方几乎无处不在，因此我们也需要修复这些地方。
+
+让我们从 http.rs 开始。
+
+http.rs
+
+我们需要做的第一件事情是从标准库中引入 Pin。文件的开头应该是这样的：
+
+ch09/e-coroutines-pin/src/http.rs
+use crate::{future::PollState, runtime::{self, reactor, Waker}, Future}; 
+use mio::Interest; 
+use std::{io::{ErrorKind, Read, Write}, pin::Pin};
+我们需要进行更改的唯一其他地方是在 HttpGetFuture 结构体的 Future 实现中，因此让我们定位到那里。我们将开始更改 poll 中的参数：
+
+ch09/e-coroutines-pin/src/http.rs
+fn poll(mut self: Pin<&mut Self>, waker: &Waker) -> PollState<Self::Output>
+由于 self 现在是 Pin<&mut Self>，我们需要进行几处小更改，以保持借用检查器的正常工作。让我们从最上面开始进行调整。
+
+http.rs
+
+let id = self.id;
+
+if self.stream.is_none() {
+    println!("第一次 poll - 开始操作");
+    self.write_request();
+    let stream = (&mut self).stream.as_mut().unwrap();
+    runtime::reactor().register(stream, Interest::READABLE, id);
+    runtime::reactor().set_waker(waker, self.id);
+}
+在顶端将 id 赋值给一个变量的原因是，借用检查器在尝试将 &mut self 和 &self 作为参数传递给 register/deregister 函数时，会给我们带来一些小麻烦，因此我们只是把 id 赋值给一个变量，大家都能愉快地继续。
+
+接下来还有两行需要更改，即我们从内部缓冲区创建一个 String 类型并与反应器注销兴趣的地方：
+
+let s = String::from_utf8_lossy(&self.buffer).to_string();
+runtime::reactor().deregister(self.stream.as_mut().unwrap(), id);
+break PollState::Ready(s);
+重要提示
+
+请注意，这个 future 是 Unpin 的。没有任何事情使得移动 HttpGetFuture 变得不安全，这确实适用于大多数类似的 future。只有那些由 async/await 创建的 future 是出于设计需要自引用的。这意味着这里不需要任何不安全的操作。
+
+接下来，让我们继续进行 main.rs，因为那里需要进行一些重要的更改。
+
+main.rs
+
+让我们从顶部开始，确保我们有正确的导入：
+
+mod future;
+mod http;
+mod runtime;
+
+use future::{Future, PollState};
+use runtime::Waker;
+use std::{fmt::Write, marker::PhantomPinned, pin::Pin};
+这一次，我们需要使用 PhantomPinned 标记和 Pin。
+
+接下来我们需要更改的是我们的 State0 枚举。我们在状态之间保存的 futures 现在是固定的：
+
+Wait1(Pin<Box<dyn Future<Output = String>>>),
+Wait2(Pin<Box<dyn Future<Output = String>>>),
+接下来是一个重要的变化。我们需要让我们的协程 !Unpin，以便它们在被固定后不能被移动。我们可以通过将一个标记特性添加到我们的 Coroutine0 结构体来实现：
+
+struct Coroutine0 {
+    stack: Stack0,
+    state: State0,
+    _pin: PhantomPinned,
+}
+我们还需要将 PhantomPinned 标记添加到我们的新函数中：
+
+impl Coroutine0 {
+    fn new() -> Self {
+        Self {
+            state: State0::Start,
+            stack: Stack0::default(),
+            _pin: PhantomPinned,
+        }
+    }
+}
+我们需要更改的最后一件事是 poll 方法。让我们从函数签名开始：
+
+fn poll(self: Pin<&mut Self>, waker: &Waker) -> PollState<Self::Output>
+我发现改变代码的最简单方法是在函数顶部定义一个名为 this 的新变量，这将在函数体内的各个地方替代 self。
+
+我不会逐行进行讲解，因为这个改变是如此微不足道，但在第一行之后，只需简单搜索并替换先前使用 self 的地方，将其更改为 this：
+
+let this = unsafe { self.get_unchecked_mut() };
+loop {
+    match this.state {
+        State0::Start => {
+            // 初始化栈（提前声明 - 此时还没有栈）
+            this.stack.buffer = Some(String::from("\nBUFFER:\n----\n"));
+            this.stack.writer = Some(this.stack.buffer.as_mut().unwrap());
+            // ---- 你实际编写的代码 ----
+            println!("程序开始");
+            ...
+        }
+    }
+}
+这里重要的一行是 let this = unsafe { self.get_unchecked_mut() };。在这里，我们需要使用 unsafe，因为由于我们添加的标记特性，固定值是 !Unpin 的。获取固定值是危险的，因为 Rust 无法保证我们不会移动固定值。
+
+值得注意的是，如果我们稍后遇到任何此类问题，我们知道可以搜索使用 unsafe 的地方，问题就一定在那里。
+
+接下来我们需要更改的是在等待状态中存储的 futures 进行固定。我们可以通过调用 Box::pin 来实现，而不是 Box::new：
+
+let fut1 = Box::pin(http::Http::get("/600/HelloAsyncAwait"));
+let fut2 = Box::pin(http::Http::get("/400/HelloAsyncAwait"));
+在 main.rs 中我们需要更改的最后一个地方是我们轮询子 futures 的位置，因为我们现在必须通过 Pin 类型来获取可变引用：
+
+match f1.as_mut().poll(waker)
+match f2.as_mut().poll(waker)
+请注意，这里不需要 unsafe，因为这些 futures 是 !Unpin 的。
+
+我们需要更改的最后几行代码位于 executor.rs 中，因此让我们最后去那里。
+
+
+executor.rs
+
+我们需要做的第一件事是确保我们的依赖项正确。我们所做的唯一更改是从标准库中添加 Pin：
+
+use std::{
+    thread::{self, Thread},
+    pin::Pin,
+};
+接下来我们要更改的是我们的 Task 类型别名，以便它现在引用 Pin<Box<…>>：
+
+type Task = Pin<Box<dyn Future<Output = String>>>;
+我们现在要更改的最后一行是在我们的 spawn 函数中。我们必须将 futures 固定到堆上：
+
+e.tasks.borrow_mut().insert(id, Box::pin(future));
+如果我们现在尝试运行示例，它甚至不会编译，并给我们以下错误：
+
+error[E0599]: no method named `poll` found for struct `Pin<Box<dyn future::Future<Output = String>>>` in the current scope
+   --> src\runtime\executor.rs:89:30
+它甚至不允许我们在未首先固定它的情况下轮询 future，因为 poll 只对 Pin<&mut Self> 类型可调用，而不再是 &mut self。
+
+因此，我们必须决定是在堆上还是栈上固定值，然后才尝试轮询。在我们的例子中，我们的整个执行器通过堆分配 futures，所以这就是唯一合理的做法。
+
+
+让我们完全移除我们的优化，并更改一行代码，使我们的执行器再次工作：
+
+match future.as_mut().poll(&waker) {
+如果您再次通过编写 cargo run 来运行程序，您应该会得到预期的输出，而无需担心协程/等待生成的 futures 被再次移动（输出略有缩短）：
+
+Finished dev [unoptimized + debuginfo] target(s) in 0.02s
+Running `target\debug\e-coroutines-pin.exe`
+Program starting
+FIRST POLL - START OPERATION
+main: 1 pending tasks. Sleep until notified.
+FIRST POLL - START OPERATION
+main: 1 pending tasks. Sleep until notified.
+BUFFER: ----
+HTTP/1.1 200 OK
+content-length: 15
+[=== ABBREVIATED ===]
+date: Sun, 03 Dec 2023 23:18:12 GMT
+HelloAsyncAwait
+main: All tasks are finished
+您现在有了自引用的协程，能够安全地在等待点之间存储数据和引用。恭喜您！尽管进行这些更改花费了不少页码，但这些更改本身在大多数情况下是相当简单的。大多数更改是因为 Pin 的 API 不同于我们之前使用引用时的 API。
+
+好消息是，这为我们将整个运行时迁移到由 async/await 创建的 futures 而不是通过 coroutine/wait 创建的自定义 futures 打下了良好的基础，仅需很少的更改。
+
+总结
+
+这一切真是一段旅程，对吧？如果您读完了这一章，您做得非常出色，我有好消息告诉您：您几乎知道了关于 Rust 的 futures 和它们特别之处的所有内容。所有复杂的主题都已涵盖。
+
+在下一章也是最后一章中，我们将从手动创建的协程转向真正的 async/await。这与您迄今为止经历过的相比，将显得轻松许多。
+
+在继续之前，让我们花一点时间回顾一下我们在这一章中学到了什么。
+
+首先，我们扩展了我们的协程实现，以便能够在等待点之间存储变量。这一点非常重要，因为如果我们的协程/等待语法要与常规同步代码在可读性和易用性上竞争，这尤为重要。
+
+之后，我们学习了如何存储和恢复持有引用的变量，这同样重要，因为能够存储数据也至关重要。
+
+接下来，我们亲眼目睹了一些我们在 Rust 中永远看不到的内容，除非我们实现一个异步系统，就像我们在这一章中所做的那样（这仅仅是为了证明一个观点而付出的巨大代价）。我们看到了移动持有自引用的协程会引发严重的内存安全问题，以及我们为什么需要某种机制来防止这种情况发生。
+
+这使我们讨论了 pinning 和自引用结构，如果您之前对这些概念不了解，现在就知道了。此外，您至少应该知道什么是 pin 投影，以及我们所说的结构性 pinning 是什么意思。
+
+然后，我们看到了将值固定到栈和将值固定到堆之间的区别。您甚至看到了在将某个东西固定到栈时，打破 Pin 保证是多么容易，以及在这样做时您应该非常小心的原因。
+
+
+您还了解了一些广泛使用的工具，用于解决 pin 投影和栈固定问题，使其变得更安全、更易于使用。
+
+接下来，我们亲身体验了如何利用 pinning 来防止我们在协程实现中遇到的问题。
+
+如果我们回顾一下到目前为止所构建的内容，实际上是相当令人印象深刻的。我们拥有以下内容：
+
+我们自己创建的协程实现
+协程/等待语法以及帮助我们处理协程样板代码的预处理器
+可以安全地在等待点之间存储数据和引用的协程
+一个高效的运行时，能够存储、调度并轮询任务直到完成
+能力来将新任务生成到运行时中，使得一个任务可以生成数百个并发运行的新任务
+一个在底层使用 epoll/kqueue/IOCP 的反应器，能够高效地等待和响应操作系统报告的新事件
+我认为这非常酷。
+
+我们这本书还没有结束。在下一章中，您将看到如何仅通过少量更改，使我们的运行时能够运行由 async/await 创建的 futures，而不是我们自己的协程实现。这使我们能够利用所有异步 Rust 的优势。我们还将花一些时间讨论今天异步 Rust 的状态、您可能遇到的不同运行时，以及我们对未来可能的期待。
+
+所有的重任现在都已经完成。干得好！
+
+# 10 创建您自己的运行时
+在前面的几章中，我们讨论了许多与 Rust 中的异步编程相关的方面，但我们是通过实现比今天 Rust 中更简单的替代抽象来完成的。
+
+本章的重点将是缩小这一差距，修改我们的运行时，使其能够与 Rust 的 futures 以及 async/await 一起工作，而不是使用我们自己实现的 futures 和 coroutine/wait。由于我们几乎涵盖了与协程、状态机、futures、wakers、运行时和 pinning 相关的一切，因此适应我们现在拥有的内容将是相对简单的任务。
+
+当我们将一切都调整到工作状态时，我们将对我们的运行时进行一些实验，以展示和讨论一些使得异步 Rust 对初学者来说有些困难的方面。我们还将花一些时间讨论对于异步 Rust 未来的期望，然后总结我们在本书中所做的和所学到的内容。
+
+我们将涵盖以下主要主题：
+
+使用 futures 和 async/await 创建我们自己的运行时
+对我们的运行时进行实验
+异步 Rust 的挑战
+异步 Rust 的未来
+技术要求
+本章中的示例将基于上一章的代码，因此要求是相同的。示例具有跨平台特性，并将在所有支持 Rust（Rust 平台支持）和 mio（mio 平台）的操作系统上运行。
+
+您唯一需要的就是安装 Rust，并在本地下载本书的代码仓库。与本章相关的所有代码都可以在 ch10 文件夹中找到。
+
+在本示例中，我们也将使用 delayserver，因此您需要打开一个单独的终端，进入仓库根目录的 delayserver 文件夹，并输入 cargo run，以便为随后的示例做好准备。
+
+如果由于某种原因您需要更改 delayserver 监听的端口，请记得在代码中更改端口。
+
+使用 futures 和 async/await 创建我们自己的运行时
+好的，现在我们处于最后阶段；我们要做的最后一件事是更改我们的运行时，以便它使用 Rust 的 Future 特性、Waker 和 async/await。现在，当我们几乎涵盖了 Rust 中异步编程中最复杂的方面，并且自己构建了一切之后，这将是相对简单的任务。我们甚至对 Rust 在此过程中所做的设计决策进行了相当详细的讨论。
+
+
+Rust 目前的异步编程模型
+Rust 目前的异步编程模型是一个逐步演变的结果。Rust 在早期阶段使用绿色线程，但那是在它达到 1.0 版本之前。在达到 1.0 版本时，Rust 的标准库中根本没有 futures 或异步操作的概念。这个领域在 futures-rs crate（futures-rs）中被探索，该 crate 目前仍然是异步抽象的一个孵化器。然而，Rust 不久就围绕一个与现在类似的 Future trait 的版本达成共识，这个版本通常被称为 futures 0.1。通过 async/await 创建的协程支持在那个时候就已经在研发之中，但直到设计进入标准库的稳定版本，花费了几年时间才实现。
+
+因此，我们在异步实现中必须做出的许多选择，实际上都是 Rust 在这个过程中所做的真实选择。尽管如此，这一切都引领我们走到了今天这个阶段，因此让我们开始调整我们的运行时，使其能够与 Rust futures 一起工作。
+
+在我们进入示例之前，让我们了解一下与我们当前实现不同的地方：
+
+Rust 使用的 Future trait 与我们现在的略有不同。最大区别在于，它接受一个称为 Context 的参数，而不是 Waker。另一个区别是，它返回一个称为 Poll 的枚举，而不是 PollState。
+
+Context 是 Rust 的 Waker 类型的一个包装器。它的唯一目的是为 API 未来的发展做好准备，以便在不更改与 Waker 相关的任何内容的情况下，能够保存额外的数据。
+
+Poll 枚举返回两种状态之一，Ready(T) 或 Pending。这与我们当前实现中的 PollState 枚举略有不同，但这两种状态的含义与 Ready(T)/NotReady 相同。
+
+Rust 中的 Waker 创建比我们当前 Waker 更加复杂。我们将在本章稍后讨论如何以及为何会这样。
+
+除了上述所列出的差异，其他内容基本上可以保持不变。在大多数情况下，我们只是在重命名和重构代码。
+
+现在我们已经对需要做的事情有了一个初步的了解，是时候设置一切，让我们的新示例运行起来了。
+
+注意
+
+即使我们创建了一个运行时以便在 Rust 中适当地运行 futures，我们仍然尝试通过避免错误处理并不专注于使我们的运行时更灵活来保持简单。改进我们的运行时当然是可能的，虽然在某些时候正确使用类型系统并使借用检查器满意可能会有些棘手，但这与异步 Rust 的关系相对较少，更与 Rust 本身的特性有关。
+
+
+提示
+您可以在本书的代码库的 ch10/a-rust-futures 文件夹中找到这个示例。
+
+我们将从上一章的结束处继续，所以让我们将我们所拥有的一切复制到一个新项目中：
+
+创建一个名为 a-rust-futures 的新文件夹。
+从上一章的示例中复制所有内容。如果您遵循我建议的命名，它将存储在 e-coroutines-pin 文件夹中。
+现在，您应该有一个包含我们之前示例副本的文件夹，所以最后要做的就是在 Cargo.toml 中将项目名称更改为 a-rust-futures。
+好的，让我们开始编写我们想要运行的程序。打开 main.rs。
+
+main.rs
+我们将返回程序的最简单版本，在尝试更复杂的东西之前先让它运行。打开 main.rs，并用以下代码替换该文件中的所有代码：
+
+mod http;
+mod runtime;
+
+use crate::http::Http;
+
+fn main() {
+    let mut executor = runtime::init();
+    executor.block_on(async_main());
+}
+
+async fn async_main() {
+    println!("Program starting");
+    let txt = Http::get("/600/HelloAsyncAwait").await;
+    println!("{txt}");
+    let txt = Http::get("/400/HelloAsyncAwait").await;
+    println!("{txt}");
+}
+这一次不需要使用 corofy 或其他特殊的东西。编译器会为我们重写这个。
+
+注意
+请注意我们已删除了 future 模块的声明。这是因为我们不再需要它。唯一的例外是如果您想保留并使用我们创建的 join_all 函数以将多个 futures 结合在一起。您可以尝试自己重写它，或者查看代码库，找到 ch10/a-rust-futures-bonus/src/future.rs 文件，在那里您会发现我们示例的相同版本，只是这个版本保留了 future 模块，并且有一个与 Rust futures 兼容的 join_all 函数。
+
+future.rs
+您可以完全删除这个文件，因为我们不再需要自己的 Future trait。
+
+让我们继续查看 http.rs，看看我们需要在那儿进行哪些更改。
+
+http.rs
+我们需要更改的第一件事是我们的依赖项。我们将不再依赖自己的 Future、Waker 和 PollState；相反，我们将依赖标准库中的 Future、Context 和 Poll。
+
+我们的依赖项现在应该看起来像这样：
+
+use crate::runtime::{self, reactor};
+use mio::Interest;
+use std::{
+    future::Future,
+    io::{ErrorKind, Read, Write},
+    pin::Pin,
+    task::{Context, Poll},
+};
+我们需要对 HttpGetFuture 的 poll 实现进行一些小的重构。首先，我们需要改变 poll 函数的签名，以使其符合新的 Future trait：
+
+fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output>
+由于我们将新参数命名为 cx，因此我们需要更改在 set_waker 中传入的内容，如下所示：
+
+runtime::reactor().set_waker(cx, self.id);
+接下来，我们需要更改我们的 future 实现，使其返回 Poll 而不是 PollState。为此，找到 poll 方法并首先更改其签名，以便与标准库中的 Future trait 匹配：
+
+fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output>
+接下来，我们需要在函数返回的地方更改返回类型（这里我只呈现了函数体的相关部分）：
+
+loop {
+    match self.stream.as_mut().unwrap().read(&mut buff) {
+        Ok(0) => {
+            let s = String::from_utf8_lossy(&self.buffer).to_string();
+            runtime::reactor().deregister(self.stream.as_mut().unwrap(), id);
+            break Poll::Ready(s.to_string());
+        }
+        Ok(n) => {
+            self.buffer.extend(&buff[0..n]);
+            continue;
+        }
+        Err(e) if e.kind() == ErrorKind::WouldBlock => {
+            // 始终存储最后给定的 Waker
+            runtime::reactor().set_waker(cx, self.id);
+            break Poll::Pending;
+        }
+        Err(e) => panic!("{e:?}"),
+    }
+}
+这就是这个文件的全部内容。不坏吧？接下来让我们看看 executor.rs 中需要更改的内容。
+
+executor.rs
+在 executor.rs 中，我们需要更改的第一件事是我们的依赖项。这次，我们只依赖标准库中的类型，我们的依赖部分现在应该看起来像这样：
+
+use std::{
+    cell::{Cell, RefCell},
+    collections::HashMap,
+    future::Future,
+    pin::Pin,
+    sync::{Arc, Mutex},
+    task::{Poll, Context, Wake, Waker},
+    thread::{self, Thread},
+};
+我们的协程将不再仅限于输出 String，因此我们可以安全地为我们的顶级 futures 使用更合理的 Output 类型：
+
+type Task = Pin<Box<dyn Future<Output = ()>>>;
+接下来的内容我们将直接深入到 Waker，因为我们在这里所做的更改将导致该文件的其他几个更改。
+
+
+创建 Waker
+在 Rust 中创建一个 waker 可能是一项相当复杂的任务，因为 Rust 希望给予我们在实现 wakers 时最大的灵活性。这个原因有两个方面：
+
+Wakers 必须在服务器和微控制器上都能正常工作。
+Waker 必须是一个零开销抽象。
+意识到大多数程序员从来不需要自己创建 wakers，因此缺乏人机工程学的成本被认为是可以接受的。
+
+直到最近，在 Rust 中构造 waker 的唯一方法是创建一个非常类似于特征对象的东西，而并不是一个特征对象。为了做到这一点，你必须经过相当复杂的过程来构建一个虚拟表（v-table，函数指针的集合），将其与 waker 存储的数据指针结合，并创建一个 RawWaker。
+
+幸运的是，我们实际上不再需要经历这个过程，因为 Rust 现在有了 Wake trait。Wake trait 在我们创建的 Waker 类型被放置在 Arc 中时运作良好。将 Waker 包裹在 Arc 中会导致堆分配，但是对于我们在这本书中讨论的系统类型的大多数 Waker 实现来说，这完全可以接受，也正是大多数生产运行时所做的。这为我们简化了许多事情。
+
+信息
+这是 Rust 采用最终被证明是生态系统最佳实践的一个例子。长期以来，构建 wakers 的一种流行方法是通过实现 futures crate（futures crate）提供的名为 ArcWake 的特征。futures crate 并不是语言的一部分，但它包含在 rust-lang 的代码库中，可以被视为一个工具箱和抽象的温床，未来可能会加入语言中。
+
+为了避免有多个同名的东西而引起混淆，让我们将具体的 Waker 类型重命名为 MyWaker：
+
+#[derive(Clone)]
+pub struct MyWaker {
+    thread: Thread,
+    id: usize,
+    ready_queue: Arc<Mutex<Vec<usize>>>,
+}
+我们可以让 wake 的实现几乎保持不变，但我们把它放在 Wake trait 的实现中，而不仅仅是在 MyWaker 上有一个 wake 函数：
+
+impl Wake for MyWaker {
+    fn wake(self: Arc<Self>) {
+        self.ready_queue
+            .lock()
+            .map(|mut q| q.push(self.id))
+            .unwrap();
+        self.thread.unpark();
+    }
+}
+您会注意到，wake 函数接受一个 self: Arc<Self> 参数，这与我们在处理 Pin 类型时看到的很相似。以这种方式编写函数签名意味着 wake 只能在被 Arc 包裹的 MyWaker 实例上调用。
+
+由于我们的 waker 略有变化，所以有几个地方需要做一些小的修正。第一个是在 get_waker 函数中：
+
+fn get_waker(&self, id: usize) -> Arc<MyWaker> {
+    Arc::new(MyWaker {
+        id,
+        thread: thread::current(),
+        ready_queue: CURRENT_EXEC.with(|q| q.ready_queue.clone()),
+    })
+}
+所以，这里没有很大的变化。唯一的区别是通过将 waker 放入 Arc 中来进行堆分配。
+
+我们需要更改的下一个地方是在 block_on 函数中。
+
+如果您还有其他问题，或者需要更多的帮助，请随时告诉我！
+
+以下是您提供的代码段的中文翻译：
+
+首先，我们需要更改 block_on 函数的签名，以使其与我们新的顶级 Future 定义相匹配：
+
+pub fn block_on<F>(&mut self, future: F) 
+where 
+    F: Future<Output = ()> + 'static, 
+{
+下一步是在 block_on 函数中更改我们如何创建 Waker，并将其包装在 Context 结构中：
+
+// 防范虚假唤醒
+None => continue,
+};
+
+let waker: Waker = self.get_waker(id).into();
+let mut cx = Context::from_waker(&waker);
+
+match future.as_mut().poll(&mut cx) {
+    ...
+这个改动有点复杂，所以我们逐步来看：
+
+首先，我们通过调用 get_waker 函数来获取 Arc<MyWaker>，就像之前一样。
+我们通过指定我们期望的类型 let waker: Waker 并在 MyWaker 上调用 into()，将 MyWaker 转换为简单的 Waker。由于每个 MyWaker 实例也是一种 Waker，这会将其转换为标准库定义的 Waker 类型，这正是我们所需要的。
+由于 Future::poll 需要的是 Context 而非 Waker，我们创建一个新的 Context 结构，并引用我们刚刚创建的 waker。
+最后，我们需要更改 spawn 函数的签名，以使其也接受新的顶级 futures 定义。
+
+
+首先，我们需要更改 spawn 函数的签名，以使其与我们新的顶级 Future 定义相匹配：
+
+pub fn spawn<F>(future: F) 
+where 
+    F: Future<Output = ()> + 'static, 
+{
+这就是我们在执行器中需要进行的最后一项更改，我们已经接近完成了。我们需要对运行时的最后一处更改是在反应器中，因此我们接下来打开 reactor.rs。
+
+reactor.rs
+我们做的第一件事是确保我们的依赖关系是正确的。我们必须移除对旧 Waker 实现的依赖，而是从标准库中引入这些类型。依赖部分应该看起来像这样：
+
+use mio::{net::TcpStream, Events, Interest, Poll, Registry, Token};
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex, OnceLock,
+    },
+    thread,
+    task::{Context, Waker},
+};
+我们需要进行两个小更改。第一个是我们的 set_waker 函数现在接受 Context，从中需要获取 Waker 对象：
+
+pub fn set_waker(&self, cx: &Context, id: usize) { 
+    let _ = self
+        .wakers
+        .lock()
+        .map(|mut w| w.insert(id, cx.waker().clone()).is_none())
+        .unwrap(); 
+}
+最后一项更改是，在 event_loop 函数中调用 wake 时，我们需要调用一个稍微不同的方法：
+
+if let Some(waker) = wakers.get(&id) { 
+    waker.wake_by_ref(); 
+}
+由于调用 wake 现在消耗了 self，我们调用了一个接受 &self 的版本，因为我们希望保留这个 waker 以备后用。
+
+就是这样。我们的运行时现在可以运行，并充分利用异步 Rust 的全部功能。让我们通过在终端输入 cargo run 来测试一下。
+
+我们应该得到与之前看到的相同的输出：
+
+程序启动
+第一次轮询 - 开始操作
+主程序：1 个挂起任务。睡眠直到被通知。
+HTTP/1.1 200 OK
+content-length: 15
+[==== 省略 ====]
+HelloAsyncAwait
+主程序：所有任务都已完成
+这非常不错，不是吗？
+
+现在我们已经创建了自己的异步运行时，利用了 Rust 的 Future、Waker、Context 和 async/await 结构。既然我们可以为自己作为运行时实现者感到自豪，接下来是进行一些实验的时刻。我会选择几个实验，这些实验也将教会我们一些关于 Rust 中的运行时和未来（futures）的内容。我们还没有完成学习。
+
+实验我们的运行时
+注意：您可以在书籍的仓库中找到这个例子，在 ch10/b-rust-futures-experiments 文件夹中。不同的实验将作为不同版本的 async_main 函数按照时间顺序实现。我会在代码片段的标题中指明哪个函数对应于仓库示例中的哪个函数。
+
+在我们开始实验之前，让我们把现在的所有内容复制到一个新文件夹：
+
+创建一个名为 b-rust-futures-experiments 的新文件夹。
+将 a-rust-futures 文件夹中的所有内容复制到新文件夹中。
+打开 Cargo.toml 并将 name 属性更改为 b-rust-futures-experiments。
+第一个实验将是用一个合适的 HTTP 客户端替换我们非常有限的 HTTP 客户端。最简单的方法是选择另一个支持异步 Rust 的高质量生产级 HTTP 客户端库，取而代之。因此，当我们尝试找到适合的 HTTP 客户端替换品时，会检查最受欢迎的高层 HTTP 客户端库列表，发现 reqwest 在最前面。那可能适合我们的目的，所以我们先试试这个。
+
+我们首先在 Cargo.toml 中通过输入以下内容，添加 reqwest 作为依赖：
+
+cargo add reqwest@0.11
+接下来，让我们更改我们的 async_main 函数，以便使用 reqwest 来替换我们自己的 HTTP 客户端：
+
+async fn async_main() {
+    println!("程序启动");
+    let url = "http://127.0.0.1:8080/600/HelloAsyncAwait1";
+    let res = reqwest::get(url).await.unwrap();
+    let txt = res.text().await.unwrap();
+    println!("{txt}");
+    let url = "http://127.0.0.1:8080/400/HelloAsyncAwait2";
+    let res = reqwest::get(url).await.unwrap();
+    let txt = res.text().await.unwrap();
+    println!("{txt}");
+}
+除了使用 reqwest API 之外，我还更改了我们发送的消息。大多数 HTTP 客户端不会向我们返回原始的 HTTP 响应，通常只提供一种方便的方式来获取响应的主体，而到目前为止，这对于我们的两个请求是相似的。
+
+应该就是我们需要更改的全部内容，所以让我们尝试通过写入以下命令来运行我们的程序：
+
+cargo run
+运行结果：
+
+正在运行 `target\debug\a-rust-futures.exe`
+程序启动
+线程 'main' 在 C:\Users\cf\.cargo\registry\src\index.crates.io-6f17d22bba15001f\tokio-1.35.0\src\net\tcp\stream.rs:160:18 崩溃：没有运行中的 reactor，必须在 Tokio 1.x 运行时的上下文中调用
+好的，所以错误告诉我们没有运行中的 reactor，并且必须在 Tokio 1.x 运行时的上下文中调用。我们知道有一个 reactor 正在运行，只不过不是 reqwest 期望的那个，因此让我们看看我们能如何修复这个问题。
+
+显然，我们需要在我们的程序中添加 Tokio，由于 Tokio 有很多功能是根据需求开放的（这意味着它默认为很少启用的功能），我们将简化操作，启用所有功能。
+
+
+cargo add tokio@1 --features full
+根据文档，我们需要启动一个 Tokio 运行时，并明确进入它以启用 reactor。将 enter 函数添加到我们的 async_main 函数顶部应该可以工作：
+
+use tokio::runtime::Runtime;
+
+async fn async_main() {
+    let rt = Runtime::new().unwrap();
+    let _guard = rt.enter();
+    println!("程序启动");
+    let url = "http://127.0.0.1:8080/600/HelloAsyncAwait1";
+    ...
+}
+注意：调用 Runtime::new 创建一个多线程 Tokio 运行时，但 Tokio 也可以通过使用运行时构建器创建单线程运行时，如下所示：
+
+Builder::new_current_thread().enable_all().build().unwrap();
+如果这样做，将会遇到一个特殊的问题：死锁。造成这种情况的原因非常有趣，您应该了解。
+
+Tokio 的单线程运行时只使用调用它的线程作为执行器和 reactor，这与我们在第 8 章中运行时的第一个版本中所做的非常相似。我们使用 Poll 实例直接停用我们的执行器。
+
+当我们的 reactor 和执行器在同一个线程中执行时，它们必须有相同的机制来停用它们自己并等待新事件，这意味着它们之间会紧密耦合。
+
+在处理事件时，reactor 必须首先唤醒以调用 Waker::wake，但执行器是最后一个停用线程的。如果执行器通过调用 thread::park（就像我们之前做的）停用自己，reactor 也会停用，并且永远不会唤醒，因为它们运行在同一个线程上。使其正常工作唯一的方法是执行器在与 reactor 共享的某些东西上停用（就像我们使用 Poll 时）。
+
+由于我们与 Tokio 没有紧密集成，我们能得到的只是一个死锁。
+
+现在，如果我们再试一次运行程序，我们将得到以下输出：
+
+
+use isahc::prelude::*;
+
+async fn async_main() {
+    println!("程序启动");
+    let url = "http://127.0.0.1:8080/600/HelloAsyncAwait1";
+    let mut res = isahc::get_async(url).await.unwrap();
+    let txt = res.text().await.unwrap();
+    println!("{txt}");
+    
+    let url = "http://127.0.0.1:8080/400/HelloAsyncAwait2";
+    let mut res = isahc::get_async(url).await.unwrap();
+    let txt = res.text().await.unwrap();
+    println!("{txt}");
+}
+现在，如果我们通过输入 cargo run 来运行程序，我们将获得以下输出：
+
+程序启动
+main: 1 个待处理任务。休眠直到接到通知。
+main: 1 个待处理任务。休眠直到接到通知。
+main: 1 个待处理任务。休眠直到接到通知。
+HelloAsyncAwait1
+main: 1 个待处理任务。休眠直到接到通知。
+main: 1 个待处理任务。休眠直到接到通知。
+main: 1 个待处理任务。休眠直到接到通知。
+HelloAsyncAwait2
+main: 所有任务都已完成
+所以，我们收到了预期的输出，而无需通过任何复杂的步骤。
+
+为什么所有这些事情都显得如此不直观呢？这个问题的答案带我们进入了编程时常见的挑战主题，特别是在使用异步 Rust 时。让我们讨论一些比较明显的挑战，并解释为什么这些挑战存在，从而帮助我们找出最佳应对策略。
+
+异步 Rust 的挑战
+我们看到，执行器和 reactor 可以松散耦合，这在理论上意味着您可以将不同的 reactor 和执行器组合在一起，但问题是，为什么在尝试进行组合时我们会遇到如此多的摩擦？
+
+大多数使用过异步 Rust 的程序员都经历过由于不兼容的异步库而引起的问题，我们之前看到过您可能会遇到的错误信息。
+
+为了解释这一点，我们需要更深入地探讨在 Rust 中现有的异步运行时，特别是那些我们通常用于桌面和服务器应用程序的运行时。
+
+显式与隐式的 reactor 实例化
+我们将要讨论的未来类型是叶子未来，代表实际的 I/O 操作（例如，HttpGetFuture）。
+
+当您在 Rust 中创建运行时时，您还需要创建 Rust 标准库的非阻塞原语。互斥锁、通道、定时器、TcpStreams 等都是需要异步对应物的项目。
+
+
+大多数这些可以实现为不同种类的 reactor，但随之而来的问题是：这个 reactor 是如何启动的？在我们自己的运行时和 Tokio 中，reactor 作为运行时初始化的一部分启动。我们有一个 runtime::init() 函数，它调用 reactor::start()，而 Tokio 则有 Runtime::new() 和 Runtime::enter() 函数。
+
+如果我们试图创建一个叶子 future（我们自己创建的唯一一个是 HttpGetFuture），而没有启动 reactor，无论是我们自己的运行时还是 Tokio 都会 panic。reactor 必须显式实例化。而 Isahc 则带来了它自己的类型的 reactor。Isahc 是基于 libcurl 构建的，libcurl 是一个高度可移植的 C 库，用于多协议文件传输。对我们而言，相关的是 libcurl 接受一个回调，当操作准备好时会调用这个回调。因此，Isahc 将其接收到的 waker 传递给这个回调，并确保在回调执行时调用 Waker::wake。虽然这有点过于简化，但本质上就是发生的事情。
+
+在实践中，这意味着 Isahc 带来了它自己的 reactor，因为它附带了存储 wakers 的机制，并在操作准备好时调用 wake。reactor 是隐式启动的。
+
+顺便说一下，这也是 async_std 和 Tokio 之间的一个主要区别。Tokio 需要显式实例化，而 async_std 则依赖于隐式实例化。
+
+我并不是为了好玩而详细阐述此事；虽然这看起来是一个小差别，但对 Rust 中异步编程的直观性产生了相当大的影响。这个问题主要出现在您开始使用与 Tokio 不同的运行时编程时，然后不得不使用一个内部依赖于 Tokio reactor 的库。由于不能在同一线程上运行两个 Tokio 实例，因此该库无法隐式启动 Tokio reactor。相反，通常发生的情况是，您尝试使用该库并遇到如我们在之前示例中所示的错误。
+
+现在，您必须通过自己启动 Tokio reactor、使用其他人创建的某种兼容包装，或者查看您使用的运行时是否具有运行依赖于 Tokio reactor 的 futures 的内置机制来解决此问题。对于大多数不了解 reactors、executors 和不同类型叶子 futures 的人来说，这可能相当不直观，并引起相当大的挫败感。
+
+注意：我们在这里描述的问题相当普遍，并且由于异步库很少对此进行良好解释或甚至试图明确它们使用的运行时类型，这个问题并没有得到缓解。有些库可能只是在 README 文件的某个地方提到它们是基于 Tokio 构建的，而有些库可能简单地声明它们是基于 Hyper 构建的，例如，假设您知道 Hyper 是基于 Tokio 构建的（至少在默认情况下）。
+
+
+任务
+我们在使用“任务”和“未来”这两个术语时，没有明确区分它们之间的区别，因此让我们在这里澄清一下。我们在第一章中首先介绍了任务，它们仍然保留了相同的一般含义，但在谈论 Rust 中的运行时时，它们有更具体的定义。任务是顶级的未来（future），即我们在执行器（executor）上生成的那一个。执行器在不同任务之间进行调度。在运行时中，任务在许多方面代表了与操作系统中的线程相同的抽象。每个任务都是 Rust 中的一个未来，但并不是每个未来在这个定义下都是任务。
+
+您可以将 thread::sleep 视为定时器，我们在异步环境中经常需要类似的东西，因此我们的异步运行时需要有一个睡眠的等效功能，以告诉执行器将这个任务在指定的时间内挂起。
+
+我们可以将其实现为一个 reactor，并让操作系统线程在指定时间内休眠，然后唤醒正确的 Waker。这将是简单的，并且与执行器无关，因为执行器对发生的事情毫无知觉，只关心在调用 Waker::wake 时调度任务。然而，对于所有工作负载而言，这并不是最优的效率（即使我们在所有定时器上使用同一线程）。
+
+解决此问题的另一种更常见的方法是将此任务委托给执行器。在我们的运行时中，这可以通过让执行器存储一个有序的时间点列表和相应的 Waker 来实现，这用来确定在调用 thread::park 之前是否有定时器已过期。如果没有定时器已过期，我们可以计算下一个定时器到期的时间，并使用 thread::park_timeout 确保我们至少在处理该定时器时唤醒。
+
+用于存储定时器的算法可以进行大量优化，您还可以避免仅为定时器而需要一个额外线程的额外开销，同时避免了这些线程之间需要进行的同步开销，只需信号一个定时器已过期。在多线程运行时中，当多个执行器频繁向同一 reactor 添加定时器时，甚至可能会存在争用问题。
+
+一些定时器以 reactor 风格作为独立库实现，对于许多任务，这已足够。这里的一个重要点是，通过使用默认设置，您最终会绑定到一个特定的运行时，如果您想避免您的库与特定的运行时紧密耦合，则需要认真考虑。
+
+每个人都认同的常见特征
+在异步 Rust 中，导致摩擦的最后一个话题是缺乏对典型异步操作的普遍认可的特征和接口。
+
+我想在这一部分前提下指出，这是一个日益改善的领域，futures-rs crate 中有一个为 Rust 的异步特征和抽象而设的“托儿所”（https://github.com/rust-lang/futures-rs）。然而，由于异步 Rust 仍处于早期阶段，这在像这样的书中提及是值得的。
+
+让我们以生成（spawning）为例。当您在 Rust 中编写高级异步库，比如一个 Web 服务器时，您可能希望能够生成新的任务（顶级的未来）。例如，连接到服务器的每个连接很可能都是您想要在执行器上生成的新任务。
+
+现在，生成是特定于每个执行器的，而 Rust 并没有定义如何生成任务的特征。未来-rs crate 中建议使用一个特征进行生成，但创建一个既为零成本又足够灵活以支持所有类型的运行时的生成特征实际上是非常困难的。
+
+有解决此问题的方法。流行的 HTTP 库 Hyper（https://hyper.rs/）例如，使用一个特征来表示执行器，并在内部使用它来生成新任务。这使得用户可以为不同的执行器实现该特征，并将其返回给 Hyper。通过为不同的执行器实现该特征，Hyper 将使用与其默认选项（即 Tokio 的执行器中的选项）不同的生成器。以下是如何将其用于使用 Hyper 的 async_std 的示例：https://github.com/async-rs/async-std-hyper。
+
+然而，由于没有普遍的实现方式，因此大多数依赖于特定执行器功能的库会采取两种做法之一：
+
+选择一个运行时并坚持使用它。
+实现两个库版本，支持不同的流行运行时，用户通过启用正确的功能进行选择。
+
+
+异步析构
+异步 Rust 中的异步析构（async drop）是一个在本书撰写时尚未完全解决的问题。Rust 使用一种称为 RAII（资源获取即初始化）的模式，这意味着当一个类型被创建时，其资源也会被初始化，而当一个类型被析构时，其资源也会被释放。编译器会在对象超出作用域时自动插入对 drop 的调用。
+
+以我们的运行时为例，当资源被析构时，它们是以阻塞的方式进行的。这通常不是大问题，因为析构过程通常不会让执行器阻塞太久，但并不总是如此。
+
+如果我们有一个需要很长时间才能完成的析构实现（例如，如果析构需要管理 I/O，或者对操作系统内核进行阻塞调用，这在 Rust 中是完全合法的，有时甚至是不可避免的），它可能会潜在地阻塞执行器。因此，在这种情况下，异步析构应该能够以某种方式向调度器让步，但目前这并不可行。
+
+现在，这并不是您作为异步库用户可能会遇到的异步 Rust 的尖锐问题，但了解这一点是值得的，因为目前确保不会出现问题的唯一方法是小心所放入异步上下文中类型的析构实现。
+
+因此，虽然这并不是导致异步 Rust 中摩擦的全部问题，但这是我认为最明显并值得了解的一些要点。
+
+在结束这一章之前，让我们花一点时间讨论一下，我们在 Rust 的异步编程中未来应该期待些什么。
+
+
+异步 Rust 的未来
+使异步 Rust 与其他语言不同的一些因素是不可避免的。异步 Rust 非常高效，延迟低，并且由于语言的设计和核心价值观，拥有非常强大的类型系统。然而，今天感知到的复杂性在很大程度上与生态系统有关，以及很多程序员在没有任何正式结构的情况下就不同问题达成一致的最佳解决方案所导致的问题。这使得生态系统在一段时间内变得支离破碎，同时又因为异步编程是一个对很多程序员来说都很难的话题，这增加了与异步 Rust 相关的认知负担。
+
+我在这一章提到的所有问题和痛点都在不断改善。几年前可能会出现在这个列表中的一些问题，如今甚至不值得一提。越来越多的通用特性和抽象将会进入标准库，使得异步 Rust 更加符合人体工程学，因为使用这些特性的所有内容将会“正常工作”。
+
+随着不同的实验和设计获得比其他方案更多的关注，它们成为事实上的标准。尽管在编写异步 Rust 时你仍然会有很多选择，但会有某些路径可以选择，从而为那些想要“正常工作”的人带来最小的摩擦。
+
+掌握足够的异步 Rust 和一般异步编程的知识后，我提到的问题毕竟是相对较小的，并且由于你对异步 Rust 的了解超过大多数程序员，我很难想象这些问题会给你带来很大的麻烦。这并不意味着这些问题不值得了解，因为你的同事程序员在某些时候可能会与其中的一些问题作斗争。
+
+
+总结
+在这一章节中，我们做了两件事。首先，我们对我们的运行时进行了相当小的修改，使其能够作为 Rust futures 的实际运行时。我们使用两个外部 HTTP 客户端库测试了运行时，以学习关于反应器、运行时和 Rust 中的异步库的一些知识。
+
+接下来，我们讨论了一些使异步 Rust 对于许多来自其他语言的程序员来说变得困难的因素。最后，我们还谈到了未来的期望。
+
+根据你如何跟随并且在此过程中对我们创建的示例进行实验，你可以选择自己想要承担什么项目，以进一步学习。学习的一个重要方面只有在你自己实验时才会发生。拆解所有东西，看看哪里出现故障，以及如何修复它。改善我们创建的简单运行时以学习新东西。
+
+有足够多有趣的项目可以选择，这里有一些建议：
+
+更换我们使用 thread::park 实现的 parker，选择一个适合的实现。你可以从库中选择一个，也可以自己创建一个（我在 ch10 文件夹的最后添加了一个名为 parker-bonus 的小赠品，其中包含一个简单的 parker 实现）。
+
+使用你自己创建的运行时实现一个简单的延迟服务器。为此，你需要能够编写一些原始的 HTTP 响应并创建一个简单的服务器。如果你阅读过名为《Rust 编程语言》的免费入门书籍，你在最后几章中创建了一个简单的服务器（第20章 - 多线程），这为你提供了所需的基础知识。你还需要创建一个定时器，正如我们上面讨论的，或者使用一个现有的异步定时器库。
+
+你可以创建一个“真正的”多线程运行时，并探索拥有全局任务队列所带来的可能性，或者作为替代方案，实现一个工作窃取调度器，当其他执行者的本地队列完成时，可以从中窃取任务。
+
+只有你的想象力限制你能做什么。值得注意的重要一点是，做某件事情仅仅是因为你可以并且只是为了乐趣中有一定的乐趣，我希望你能从中获得与我相同的享受。
+
+最后，我将以几句话结束这一章节，讲述如何让你作为异步程序员的生活尽可能轻松。
+
+
+首先认识到异步运行时的重要性
+首先要意识到，异步运行时不仅仅是您使用的另一个库。它极具侵入性，几乎会影响您程序中的所有内容。它是一个重新编写、调度任务并重新排列程序流程的层次，这与您所习惯的东西大相径庭。
+
+如果您并不特别想学习有关运行时的内容，或者有非常具体的需求，我明确推荐您选择一个运行时，并坚持使用一段时间。学习关于它的所有知识——不一定从一开始就了解所有内容，但随着您对它的需求不断增加，最终您会学到一切。这几乎就像让自己对 Rust 标准库中的每一项内容感到舒适。
+
+您开始使用哪个运行时部分取决于您使用的库。Smol 和 async-std 共享许多实现细节，并且表现相似。它们的主要卖点是其 API 力求与标准库尽可能接近。再加上反应器是隐式实例化的，这可能导致一种稍微更直观的体验和更温和的学习曲线。这两者都是生产级的运行时，并且得到了广泛使用。Smol 最初创建的目标是拥有易于程序员理解和学习的代码库，我认为至今仍然适用。
+
+话虽如此，在撰写时，对于寻找通用运行时的用户，最受欢迎的替代品是 Tokio（https://tokio.rs/）。Tokio 是 Rust 中最古老的异步运行时之一。它正在积极开发，并且拥有一个热情和活跃的社区。其文档非常优秀。
+
+作为最受欢迎的运行时之一，这也意味着您很可能找到一个库，完全满足您的需求，并且直接支持 Tokio。就个人而言，我倾向于选择 Tokio，原因如上所述，但除非您有非常具体的要求，否则这两个运行时都不会出错。
+
+最后，别忘了提到 futures-rs 库（https://github.com/rust-lang/futures-rs）。我早先提到过这个库，但了解它是非常有用的，因为它包含了多个异步 Rust 所需的特征、抽象和执行器（https://docs.rs/futures/latest/futures/executor/index.html）。它充当一个异步工具箱，在许多情况下都非常方便。
+
+
+尾声
+所以，你已经到达了最后。首先，恭喜你！你完成了一段相当精彩的旅程！
+
+我们从第一章讨论并发与并行开始。我们甚至涵盖了一些关于历史、CPU 和操作系统、硬件以及中断的内容。在第二章中，我们讨论了编程语言如何建模异步程序流。我们介绍了协程以及有栈协程和无栈协程的区别。我们讨论了操作系统线程、纤程/绿色线程以及回调及其优缺点。
+
+接着在第三章中，我们了解了操作系统支持的事件队列，例如 epoll、kqueue 和 IOCP。我们甚至深入探讨了系统调用和跨平台抽象。在第四章中，我们在使用 epoll 实现我们自己的 mio 风格事件队列时遇到了相当困难的地形。我们甚至需要学习边缘触发与水平触发事件之间的区别。
+
+如果第四章有些崎岖，那么第五章就更像是攀登珠穆朗玛峰。没有人会指望你记住那部分涵盖的所有内容，但你读过它，并且有一个可以用来进行实验的工作示例。我们实现了自己的纤程/绿色线程，同时学习了关于处理器架构、指令集架构（ISA）、应用二进制接口（ABI）和调用约定的一些知识。我们甚至对 Rust 中的内联汇编了解了很多。如果你之前对栈与堆的差异感到不安，现在你肯定明白了，因为我们创建了栈，使得 CPU 跳转到了我们自己定义的地方。
+
+在第六章中，我们对异步 Rust 进行了高层次的介绍，然后在第七章及以后深入探索，从创建自己的协程和协程/等待语法开始。在第八章中，我们讨论了基本的运行时设计，并创建了我们自己运行时的第一个版本。我们还深入研究了反应器、执行器和唤醒器。
+
+在第九章中，我们改进了我们的运行时，并发现了 Rust 中自引用结构体的危险。随后我们详细了解了 Rust 中的 pinning，以及它如何帮助我们解决所遇到的问题。
+
+最后，在第十章中，我们看到通过一些相当小的改变，我们的运行时成为了一个完全功能的 Rust futures 运行时。我们以讨论异步 Rust 中一些众所周知的挑战以及对未来的一些期望作为结束。
+
+Rust 社区非常具有包容性和友好，假如你觉得这个主题有趣并想了解更多，我们非常欢迎你参与和贡献。异步 Rust 变得更好的方式之一是通过来自各级经验人士的贡献。如果你想参与，那么异步工作组（https://rust-lang.github.io/wg-async/welcome.html）是一个好的起点。围绕 Tokio 项目（https://github.com/tokio-rs/tokio/blob/master/CONTRIBUTING.md）还有一个非常活跃的社区，还有很多其他社区，具体取决于你想深入研究的领域。不要害怕加入不同的频道并提出问题。
+
+现在我们到了最后，我想感谢你一路读到最后。我希望这本书像是我们一起经历的旅程，而不是一场讲座。我希望你是重点，而不是我。我希望我成功做到这一点，我真心希望你学到了一些你觉得有用的东西，并能够在未来继续使用。如果是这样，我真诚地感到我的工作对你是有价值的。祝你在未来的异步编程中好运。
+
+再见！
+卡尔·弗雷德里克
+
+
+
+
+
