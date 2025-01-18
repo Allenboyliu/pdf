@@ -2864,5 +2864,1940 @@ Rust 中一个完全工作的异步系统可以分为三个部分：
 执行器 (Executor)：调度器
 Future：一个可以在特定时点停止和恢复的任务
 那么，如何将这三部分协同工作呢？让我们来看一个图表，它显示了异步运行时的简化概述。
+图6.1 – 反应器、执行器和唤醒器
+
+在图中的第1步，执行器持有一个未来 (future) 的列表。它会尝试通过对未来进行轮询来运行它（轮询阶段），并在此过程中将一个唤醒器 (Waker) 传递给未来。未来要么返回 Poll::Ready（这意味着它已经完成），要么返回 Poll::Pending（这意味着它尚未完成，但目前无法进一步推进）。当执行器收到其中一个结果时，它知道可以开始轮询另一个未来。我们称这些把控制权转回执行器的点为“让步点”（yield points）。
+
+在第2步中，反应器存储了执行器在轮询未来时传递的 Waker 的副本。反应器通过第4章中介绍的相同类型的事件队列来跟踪该 I/O 源上的事件。
+
+在第3步，当反应器收到某个被跟踪源上发生事件的通知时，它会找到与该源相关的 Waker，并调用 Waker::wake。这将通知执行器未来准备好进行进展，因此它可以再次对其进行轮询。
+
+如果我们用伪代码编写一个简短的异步程序，它看起来会像这样：
+
+async fn foo() {
+    println!("Start!");
+    let txt = io::read_to_string().await.unwrap();
+    println!("{txt}");
+}
+我们写 await 的那一行是将控制权返回给调度程序的行。这通常被称为让步点，因为它会返回 Poll::Pending 或 Poll::Ready（第一次对未来进行轮询时，最有可能返回 Poll::Pending）。
+
+由于 Waker 在所有执行器中是相同的，因此，理论上反应器可以完全无视执行器的类型，反之亦然。执行器和反应器之间不需要直接进行通信。
+
+该设计赋予了 futures 框架强大和灵活的能力，并允许 Rust 标准库为我们提供一种符合人体工程学的零成本抽象。
+
+注意
+
+我在这里介绍反应器和执行器的概念，就像这是每个人都了解的内容一样。我知道情况并非如此，不用担心，我们将在下一章中详细讨论这个内容。
+
+Rust语言和标准库处理的内容
+
+Rust 只提供模型化语言中异步操作所需的内容。基本上，它提供了以下内容：
+
+一个表示操作的通用接口，它将在未来通过 Future 特征完成
+一种符合人体工程学的创建任务（准确地说是无栈协程）的方法，可以通过 async 和 await 关键字挂起和恢复
+一个定义的接口，通过 Waker 类型唤醒挂起的任务
+这就是 Rust 标准库的真正功能。如您所见，没有非阻塞 I/O 的定义，创建这些任务或如何运行它们。标准库没有非阻塞版本，因此，要实际运行异步程序，您必须创建或决定使用某种运行时。
+
+I/O 和 CPU 密集型任务
+
+如您所知，您通常编写的被称为非叶子未来。让我们来看一下使用伪 Rust 的这个异步块作为示例：
+
+let non_leaf = async {
+    let mut stream = TcpStream::connect("127.0.0.1:3000").await.unwrap();
+    // 请求一个大型数据集
+    let result = stream.write(get_dataset_request).await.unwrap();
+    // 等待数据集
+    let mut response = vec![];
+    stream.read(&mut response).await.unwrap();
+    // 对数据集进行一些 CPU 密集型分析
+    let report = analyzer::analyze_data(response).unwrap();
+    // 发送结果
+    stream.write(report).await.unwrap();
+};
+我已经强调了我们将控制权让渡给运行时执行器的点。重要的是要注意，我们在让步点之间编写的代码与执行器在同一线程上运行。这意味着当我们的分析器在处理数据集时，执行器正忙于计算，而不是处理新请求。
+
+幸运的是，有几种方式可以处理这个问题，并且这并不困难，但您必须意识到：
+
+我们可以创建一个新的叶子 future，它将我们的任务发送到另一个线程，并在任务完成时解决。我们可以像任何其他 future 一样等待这个叶子 future。
+运行时可以有某种类型的监督者，监控不同任务所需的时间，并将执行器本身移动到另一个线程，这样即使我们的分析器任务阻塞了原始执行器线程，它也可以继续运行。
+您可以自己创建一个与运行时兼容的反应器，以您认为合适的方式进行分析，并返回一个可以被等待的 future。
+现在，第一种方式是处理此问题的常见方法，但某些执行器也实现了第二种方法。第 2 种方法的问题在于，如果您切换运行时，则需要确保它也支持这种监督，否则您将最终阻塞执行器。第三种方法更具理论重要性；通常，您会愿意将任务发送到大多数运行时提供的线程池中。
+
+
+大多数执行器都有一种使用诸如 spawn_blocking 方法来完成第 1 项的方式。这些方法将任务发送到运行时创建的线程池中，在那里您可以执行 CPU 密集型任务或运行时不支持的阻塞任务。
+
+总结
+
+因此，在这一短章中，我们向您介绍了 Rust 的 futures。您现在应该对 Rust 的异步设计有了基本的了解，了解语言为您提供了什么以及您需要从其他地方获取什么。您还应该对叶子 future 和非叶子 future 有一个概念。这些方面很重要，因为它们是内置于语言中的设计决策。您到现在应该知道 Rust 使用无栈协程来建模异步操作，但由于协程本身并不执行任何操作，因此了解如何调度和运行这些协程的选择权在于您自己，是非常重要的。
+
+随着我们开始详细解释这一切如何工作，理解会更为深入。现在，我们已经对 Rust 的 futures 有了一个高层次的概述，我们将开始从基础解释它们如何工作。下一章将涵盖 future 的概念，以及它们如何与 Rust 中的协程和 async / await 关键字连接。我们将亲自看到它们如何代表可以暂停和恢复执行的任务，这是使多个任务同时进行的先决条件，以及它们与我们在第 5 章中实现的可暂停/可恢复任务的不同之处。
+
+
+* 7 协程和 async/await
+
+现在您已经对 Rust 的异步模型有了简要的介绍，接下来我们将看看这在我们迄今为止所覆盖的所有内容中的适用性。Rust 的 futures 是基于无栈协程的异步模型的例子，而在这一章中，我们将探讨这实际上意味着什么，以及它与有栈协程（fibers/green threads）之间的区别。
+
+我们将围绕一个基于 futures 和 async/await 的简化模型的示例，看看我们如何利用它来创建可挂起和恢复的任务，就像我们创建自己的 fibers 时所做的那样。好消息是，这比实现我们自己的 fibers/green threads 要简单得多，因为我们可以留在 Rust 中，这样更安全。另一个方面是，这有点抽象，并且与编程语言理论如计算机科学有很大的关系。
+
+在这一章中，我们将覆盖以下内容：
+
+无栈协程简介
+手动编写协程的示例
+async/await
+技术要求
+这一章中的所有示例都是跨平台的，所以您所需要的只是安装 Rust 并在本地下载与书籍相关的代码库。这一章中的所有代码都可以在 ch07 文件夹中找到。
+
+我们在这个示例中也会使用 delayserver，因此您需要打开一个终端，进入代码库根目录下的 delayserver 文件夹，并输入 cargo run，以便它为接下来的示例准备就绪并可用。如果出于某种原因需要更改 delayserver 监听的端口，请记得在代码中更改端口号。
+
+无栈协程简介
+
+现在，我们终于来到了介绍本书中建模异步操作的最后一种方法的时刻。您可能还记得，在第 2 章中我们给出了有栈和无栈协程的高级概述。在第 5 章中，我们在编写自己的 fibers/green threads 时实现了有栈协程的示例，因此现在是时候仔细看看无栈协程是如何实现和使用的。
+
+无栈协程是一种表示可以被中断和恢复的任务的方式。如果您记得第一章提到的内容，如果我们希望任务并发运行（同时进行），但不一定是并行运行，我们需要能够暂停和恢复任务。在其最简单的形式中，协程只是一个可以通过将控制权交还给其调用者、另一个协程或调度器来停止和恢复的任务。
+
+许多语言都有提供运行时的协程实现，它处理调度和非阻塞 I/O，但区分协程是什么和创建异步系统所涉及的其他机制是非常有益的。这在 Rust 中尤其如此，因为 Rust 并没有提供运行时，仅提供您创建具有原生语言支持的协程所需的基础设施。Rust 确保每个在 Rust 中编程的人使用相同的抽象来表示可以暂停和恢复的任务，但将启动和运行异步系统的所有其他细节留给程序员。
+
+无栈协程还是仅仅协程？
+
+您通常会看到无栈协程只被称为协程。为了保持一些一致性（您记得我不喜欢介绍根据上下文意义不同的术语），我一直将协程称为无栈或有栈，但在接下来的内容中，我将简单称无栈协程为协程。当您在其他来源阅读它们时，您也将会看到这一点。
+
+Fibers/green threads 以与操作系统非常相似的方式代表可恢复的任务。一个任务有一个栈，在该栈中存储/恢复其当前执行状态，使得能够暂停和恢复该任务。
+
+
+
+在其最简单的形式中，协程只是一个可以通过将控制权交还给调用者、另一个协程或调度器来停止和恢复的任务。许多编程语言都实现了协程，并且提供了处理调度和非阻塞 I/O 的运行时，但区分协程本身和创建异步系统所涉及的其他机制是非常有益的。这在 Rust 中尤其如此，因为 Rust 没有提供运行时，只提供创建具有原生支持的协程所需的基础设施。Rust 确保每个在 Rust 中编程的人使用相同的抽象来表示可以暂停和恢复的任务，但将启动和运行异步系统的所有其他细节留给程序员。
+
+无栈协程还是仅仅协程？
+
+您通常会看到无栈协程被简单地称为协程。为了保持一致性（您记得我不喜欢引入根据上下文意义不同的术语），我一直将协程称为无栈或有栈，但在接下来的内容中，我将简单称无栈协程为协程。当您在其他来源阅读它们时，您也将会看到这一点。
+
+Fibers/green threads 以与操作系统非常相似的方式代表可恢复的任务。一个任务有一个栈，在该栈中存储/恢复其当前执行状态，使得能够暂停和恢复该任务。
+
+最简单形式的状态机是一个具有预定状态集合的数据结构。在协程的情况下，每个状态表示一个可能的暂停/恢复点。我们并不在单独的栈中存储所需的状态来暂停/恢复任务，而是将其保存在数据结构中。这有一些优势，我之前已经提到过，但最明显的优势是它们非常高效和灵活。缺点是您绝对不想手动编写这些状态机（您将在本章中看到原因），因此您需要编译器或其他机制的某种支持，将您的代码重写为状态机，而不是普通的函数调用。
+
+结果是您得到的东西看起来非常简单。它看起来像是一个函数或子程序，您可以轻松地将其映射到可以使用简单的汇编调用指令运行的东西，但实际上您得到的是一些相当复杂且与此不同的东西，且它看起来与您期望的完全不同。
+
+
+生成器与协程
+
+生成器也是状态机，正是我们将在本章中讨论的那种。它们通常在语言中实现，用于创建向调用函数返回值的状态机。从理论上讲，您可以根据它们所返回的对象来区分协程和生成器。生成器通常仅限于向调用函数返回值。协程可以向另一个协程、调度器或简单地向调用者返回值，在这种情况下它们就像生成器。
+
+在我看来，真没有必要区分它们。它们代表了创建可以暂停和恢复其执行任务的相同基础机制，因此在本书中，我们将它们视为基本相同的事物。
+
+现在我们已经在文本中讨论了协程，我们可以开始查看它们在代码中的样子。
+
+手写协程的示例
+
+我们将使用的示例是 Rust 异步模型的简化版本。我们将创建和实现以下内容：
+
+我们自己简化的 Future trait
+一种只能进行 GET 请求的简单 HTTP 客户端
+作为状态机实现的可以暂停和恢复的任务
+我们自己简化的 async/await 语法，称为 coroutine/wait
+自制的预处理器，将我们的 coroutine/wait 函数转换为状态机，方法与 async/await 转换相同
+因此，为了真正解开协程、 futures 和 async/await 的神秘面纱，我们将不得做出一些妥协。如果我们不这么做，我们最终会重新实现如今 Rust 中的一切 async/await 和 futures，这对于理解基础技术和概念来说太复杂了。
+
+因此，我们的示例将包括以下内容：
+
+避免错误处理。如果出现任何问题，我们会 panic。
+具体而非通用。创建通用解决方案会引入大量复杂性，并使基础概念更难推理，因此我们必须创建额外的抽象层。我们的解决方案会在需要的地方具有一些通用方面。
+在功能上受到限制。当然，您可以自由扩展、修改和玩弄所有示例（我鼓励您这样做），但在该示例中，我们只涵盖所需内容，不做更多。
+避免宏。
+那么，既然这些都处理完了，让我们开始我们的示例。您需要做的第一件事是创建一个新文件夹。这个第一个示例可以在代码库的 ch07/a-coroutine 中找到，因此我建议您也将文件夹命名为 a-coroutine。接着，进入文件夹并输入 cargo init 来初始化一个新的 crate。
+
+现在我们已经启动了一个新项目，可以创建我们所需的模块和文件夹：首先，在 main.rs 中，声明两个模块，如下所示。
+
+
+ch07/a-coroutine/src/main.rs
+
+mod http;
+mod future;
+接下来，在 src 文件夹中创建两个新文件：
+
+future.rs，用于持有我们与 Future 相关的代码
+http.rs，用于我们的 HTTP 客户端相关代码
+我们还需要做一件事，就是添加对 mio 的依赖。我们将使用 mio 中的 TcpStream，因为我们将在接下来的章节中基于这个示例，并使用 mio 作为我们的非阻塞 I/O 库，因为我们对它已经很熟悉：
+
+ch07/a-coroutine/Cargo.toml
+
+[dependencies]
+mio = { version = "0.8", features = ["net", "os-poll"] }
+让我们从 future.rs 开始，先实现与 Future 相关的代码。
+
+Futures 模块
+
+在 futures.rs 中，我们首先要定义一个 Future trait。它看起来如下：
+
+pub trait Future {
+    type Output;
+    fn poll(&mut self) -> PollState<Self::Output>;
+}
+如果我们将其与 Rust 标准库中的 Future trait 进行对比，您会发现它非常相似，唯一的区别在于我们不将 cx: &mut Context<'_> 作为参数，并且我们返回一个略有不同名称的枚举，只是为了区分它们，以免混淆：
+
+pub trait Future {
+    type Output;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output>;
+}
+接下来，我们定义一个 PollState<T> 枚举：
+
+pub enum PollState<T> {
+    Ready(T),
+    NotReady,
+}
+同样，如果我们将其与 Rust 标准库中的 Poll 枚举进行比较，会发现它们几乎相同：
+
+pub enum Poll<T> {
+    Ready(T),
+    Pending,
+}
+现在，这就是我们需要的所有内容，以使示例的第一轮运行起来。接下来我们进入下一个文件：http.rs。
+
+HTTP 模块
+
+在这个模块中，我们将实现一个非常简单的 HTTP 客户端。这个客户端只能向我们的 delayserver 发出 GET 请求，因为我们只使用它来表示典型的 I/O 操作，并且并不关心能够超出所需内容。
+
+我们将首先导入一些来自标准库的类型和 trait 以及我们的 Futures 模块：
+
+use crate::future::{Future, PollState};
+use std::io::{ErrorKind, Read, Write};
+接下来，我们创建一个小的辅助函数来写入我们的 HTTP 请求。我们在本书中以前用过这段代码，因此我这里不再花时间解释。
+
+
+ch07/a-coroutine/src/http.rs
+fn get_req(path: &str) -> String {
+    format!(
+        "GET {path} HTTP/1.1\r\n\
+         Host: localhost\r\n\
+         Connection: close\r\n\
+         \r\n"
+    )
+}
+所以，现在我们可以开始编写我们的 HTTP 客户端了。实现非常简短和简单：
+
+pub struct Http;
+
+impl Http {
+    pub fn get(path: &str) -> impl Future<Output = String> {
+        HttpGetFuture::new(path)
+    }
+}
+我们在这里并不真正需要一个结构体，但我们添加了一个，因为我们可能想在稍后添加一些状态。这也是一个将与 HTTP 客户端相关的函数聚在一起的好方法。
+
+我们的 HTTP 客户端只有一个函数 get，它最终会向我们的 delayserver 发送一个 GET 请求，路径是我们指定的（记住，路径是示例 URL 中加粗的所有内容：http://127.0.0.1:8080/1000/HelloWorld）。
+
+您在函数体中首先会注意到这里没有太多事情发生。我们只返回 HttpGetFuture，就是这样。
+
+在函数签名中，您会看到它返回一个实现了 Future trait 的对象，当它被解析时输出一个字符串。我们从这个函数返回的字符串将是我们从服务器收到的响应。
+
+现在，我们本可以直接在 Http 结构体上实现 Future trait，但我认为一个更好的设计是允许一个 Http 实例提供多个 Futures，而不是让 Http 本身实现 Future。
+
+
+让我们更仔细地看看 HttpGetFuture，因为那里发生的事情更多。为了避免今后有任何疑问，HttpGetFuture 是一个叶子 future 的例子，它将是我们在这个例子中使用的唯一叶子 future。让我们将结构体声明添加到文件中：
+
+ch07/a-coroutine/src/http.rs
+struct HttpGetFuture {
+    stream: Option<mio::net::TcpStream>,
+    buffer: Vec<u8>,
+    path: String,
+}
+这个数据结构将会为我们保留一些数据：
+
+stream: 这保存的是 Option<mio::net::TcpStream>。这会是一个 Option，因为我们在创建这个结构时不会同时连接到流。
+buffer: 我们将从 TcpStream 中读取数据，并将其全部放入这个缓冲区，直到我们读取完从服务器返回的所有数据。
+path: 这简单地存储我们的 GET 请求的路径，以便我们可以稍后使用它。
+接下来我们将查看 HttpGetFuture 的 impl 块：
+
+ch07/a-coroutine/src/http.rs
+impl HttpGetFuture {
+    fn new(path: &'static str) -> Self {
+        Self {
+            stream: None,
+            buffer: vec![],
+            path: path.to_string(),
+        }
+    }
+
+    fn write_request(&mut self) {
+        let stream = std::net::TcpStream::connect("127.0.0.1:8080").unwrap();
+        stream.set_nonblocking(true).unwrap();
+        let mut stream = mio::net::TcpStream::from_std(stream);
+        stream.write_all(get_req(&self.path).as_bytes()).unwrap();
+        self.stream = Some(stream);
+    }
+}
+impl 块定义了两个函数。第一个是 new，它简单地设置初始状态。下一个函数是 write_request，它将 GET 请求发送到服务器。你之前在第 4 章的示例中见过这段代码，因此这应该看起来很熟悉。
+
+注意：在创建 HttpGetFuture 时，我们实际上并没有做与 GET 请求相关的任何事情，这意味着对 Http::get 的调用会立即返回一个简单的数据结构。
+
+
+与先前的示例相比，我们传入 localhost 的 IP 地址而不是 DNS 名称。我们和之前一样采用相同的快捷方式，将连接设为阻塞，其他所有操作设为非阻塞。下一步是将 GET 请求写入服务器。这将是非阻塞的，我们不必等待它完成，因为无论如何我们都会等待响应。
+
+该文件的最后部分是我们定义的 Future 特征的实现：
+
+ch07/a-coroutine/src/http.rs
+impl Future for HttpGetFuture {
+    type Output = String;
+
+    fn poll(&mut self) -> PollState<Self::Output> {
+        if self.stream.is_none() {
+            println!("第一次 poll - 启动操作");
+            self.write_request();
+            return PollState::NotReady;
+        }
+
+        let mut buff = vec![0u8; 4096];
+        loop {
+            match self.stream.as_mut().unwrap().read(&mut buff) {
+                Ok(0) => {
+                    let s = String::from_utf8_lossy(&self.buffer);
+                    break PollState::Ready(s.to_string());
+                }
+                Ok(n) => {
+                    self.buffer.extend(&buff[0..n]);
+                    continue;
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    break PollState::NotReady;
+                }
+                Err(e) if e.kind() == ErrorKind::Interrupted => {
+                    continue;
+                }
+                Err(e) => panic!("{e:?}"),
+            }
+        }
+    }
+}
+好的，这就是所有操作发生的地方。我们首先将名为 Output 的关联类型设置为 String。
+
+接下来，我们检查这是第一次调用 poll 还是不是。我们通过检查 self.stream 是否为 None 来完成这项工作。如果是第一次调用 poll，我们打印一条消息（以便我们可以看到这个 Future 第一次被轮询），然后写 GET 请求到服务器。
+
+在第一次轮询中，我们返回 PollState::NotReady，因此 HttpGetFuture 至少需要再次被轮询才能实际返回任何结果。
+
+该函数的下一部分是尝试从我们的 TcpStream 中读取数据。我们之前已经讨论过这个，所以我将简要介绍，但基本上可以发生五种情况：
+
+调用成功返回 0 字节已读取。我们已从流中读取完所有数据并收到了整个 GET 响应。我们从已读取的数据创建一个 String，并在返回前将其包装在 PollState::Ready 中。
+
+调用成功返回 n > 0 字节已读取。如果是这种情况，我们将数据读取到缓冲区，将数据附加到 self.buffer 中，并立即尝试从流中读取更多数据。
+
+我们收到 WouldBlock 类型的错误。如果是这种情况，我们知道由于我们将流设置为非阻塞，数据尚未准备好或有更多数据但我们尚未接收。在这种情况下，我们返回 PollState::NotReady 来传达需要更多的 poll 调用以完成操作。
+
+我们收到 Interrupted 类型的错误。这是一个特殊情况，因为读取可能会被信号中断。如果发生这种情况，通常的处理方式是简单地再尝试读取一次。
+
+我们收到无法处理的错误，由于我们的示例不进行错误处理，因此我们直接 panic！
+
+我想指出一点微妙之处。我们可以将此视为一个非常简单的状态机，具有三种状态：
+
+
+未开始，由 self.stream 为 None 指示；
+待处理，由 self.stream 为 Some 和 stream.read 返回 WouldBlock 指示；
+已解决，由 self.stream 为 Some 和对 stream.read 调用返回 0 字节指示。
+
+正如你所看到的，这种模型与操作系统在尝试读取我们的 TcpStream 时报告的状态很好地映射。
+
+大多数叶子未来（futures）如这个示例将非常简单，尽管我们在这里没有明确列出状态，但它仍然适合我们所基于的协程状态机模型。
+
+所有 futures 都必须是懒惰的吗？
+懒惰的 future 是指在第一次被轮询之前没有任何工作发生。在你阅读 Rust 中的 futures 时，这将经常出现，因为我们自己的 Future 特性就是基于同样的模型，因此这里也会出现同样的问题。对此问题的简单回答是：不！没有什么强制要求像我们在这里编写的叶子 futures 一定要懒惰。如果我们想的话，可以在调用 Http::get 函数时发送 HTTP 请求。如果你仔细想想这样做会带来一个潜在的大变化，影响我们在程序中实现并发的方式。
+
+现在的工作方式是，至少要有人调用一次 poll 才能真正发送请求。结果是，调用这个 future 的人将需要在多个 futures 上调用 poll 才能启动操作，如果他们想让它们并发运行。如果我们在创建 future 时立即启动操作，则可以创建许多 futures，尽管你一次一个地轮询它们，它们仍然会全部并发运行。如果在当前设计中你一次一个地轮询它们以完成， futures 将不会并发进展。请稍作思考。
+
+像 JavaScript 这样的语言在创建协程时就启动了操作，因此并没有“单一方式”来做到这一点。每当你遇到协程实现时，你应该找出它们是懒惰的还是急切的，因为这会影响你如何编程。尽管在这种情况下我们可以让我们的 future 急切，但我们真的不应该。由于 Rust 的程序员期望 futures 是懒惰的，他们可能依赖于在你调用 poll 之前不会发生任何事情，如果你编写的 futures 表现得不同，可能会导致意想不到的副作用。
+
+现在，当你听到 Rust 的 futures 总是懒惰的这一说法时，我经常看到的这一说法，指的是通过使用 async/await 生成的编译器生成的状态机。正如我们稍后将看到的，当你的 async 函数被编译器重写时，它们是以一种方式构造的，以确保你在 async 函数主体中编写的内容在第一次调用 Future::poll 之前不会执行。
+
+好的，所以我们已经介绍了 Future 特性和我们命名为 HttpGetFuture 的叶子 future。接下来的步骤是创建一个我们可以在预定义点停止和恢复的任务。
+
+创建协程
+我们将继续从基础开始构建我们的知识和理解。我们首先要做的是创建一个可以通过手动将其建模为状态机的任务，以便我们可以停止和恢复。
+
+
+
+一旦我们完成了这一步，我们将看看这种建模可暂停任务的方式如何使我们能够编写类似于 async/await 的语法，并依赖代码转换来创建这些状态机，而不是手动编写它们。
+
+我们将创建一个简单的程序，其功能如下：
+
+当我们的可暂停任务开始时打印一条消息。
+向我们的延迟服务器发送 GET 请求。
+等待 GET 请求的响应。
+打印服务器的响应。
+向我们的延迟服务器发送第二个 GET 请求。
+等待来自服务器的第二个响应。
+打印服务器的响应。
+退出程序。
+此外，我们将通过在手动创建的协程上调用 Future::poll 来执行我们的程序，直到其完成为止。由于我们将在下一章中讨论运行时、反应器或执行器，因此此时还没有这些组件。
+
+如果我们将程序编写为一个 async 函数，其外观如下：
+
+async fn async_main() {     
+    println!("Program starting");     
+    let txt = Http::get("/1000/HelloWorld").await;     
+    println!("{txt}");     
+    let txt2 = Http::get("/500/HelloWorld2").await;     
+    println!("{txt2}"); 
+}
+在 main.rs 中，首先进行必要的导入和模块声明：
+
+use std::time::Instant; 
+mod future; 
+mod http; 
+use crate::http::Http; 
+use future::{Future, PollState};
+接下来，我们编写名为 Coroutine 的可停止/可恢复任务：
+
+struct Coroutine {     
+    state: State, 
+}
+如果你有其他问题或需要进一步帮助，请随时告诉我！
+
+
+让我们从头开始：
+
+我们首先将输出类型设置为 ()。因为我们不会返回任何内容，这使得我们的示例更简单。
+接下来是 poll 方法的实现。你会注意到，我们写了一个循环实例，匹配 self.state。我们这样做是为了推进状态机，直到达到一个无法继续的点，而无需从子未来中获取 PollState::NotReady。
+如果状态是 State::Start，我们知道这是第一次调用 poll，因此我们运行所需的指令，直到我们达到需要解析的新未来的点。
+当我们调用 Http::get 时，我们会收到一个需要完成的未来，以便继续前进。
+此时，我们将状态更改为 State::Wait1，并存储我们想要解析的未来，以便在下一个状态中访问它。
+现在我们的状态机已经将状态从 Start 更改为 Wait1。由于我们在循环 match 语句，因此立即进入下一个状态，并将在下一次迭代中达到 State::Wait1 的匹配臂。
+我们在 Wait1 中的第一件事是对正在等待的 Future 实例调用 poll。
+如果未来返回 PollState::NotReady，我们通过退出循环并返回 NotReady 将其抛出给调用者。
+如果未来返回 PollState::Ready 以及我们的数据，我们知道可以执行依赖于第一个未来的数据的指令并进入下一个状态。在我们的案例中，我们只打印返回的数据，因此只有一行代码。
+接下来，我们通过调用 Http::get 到达获取新未来的点。我们将状态设置为 Wait2，就像我们从 State::Start 到 State::Wait1 时所做的那样。
+就像第一次遇到需要解析的未来一样，我们将其保存以便在 State::Wait2 中访问。
+由于我们在循环中，下一个发生的事情是达到 Wait2 的匹配臂，在这里，我们重复与 State::Wait1 相同的步骤，但对不同的未来。
+如果返回数据和 Ready，我们对其进行操作，并将我们的 Coroutine 的最终状态设置为 State::Resolved。还有一个重要的变化是：这次，我们希望向调用者传达这个未来已完成，因此我们退出循环并返回 PollState::Ready。
+如果有人尝试再次调用我们的 Coroutine 的 poll，我们将会出现恐慌，因此调用者必须确保跟踪何时未来返回 PollState::Ready，并确保不再调用它。
+
+在我们到达主函数之前，我们最后做的事情是创建一个新的 Coroutine，在我们调用的函数 async_main 中。这样，当我们开始讨论本章最后一部分的 async/await 时，我们可以将更改保持在最低限度：
+
+fn async_main() -> impl Future<Output = ()> {     
+    Coroutine::new() 
+}
+因此，到目前为止，我们已经完成了协程的编写，剩下的只是编写一些逻辑来驱动我们的状态机通过主函数的不同阶段。需要注意的一点是，我们的主函数只是一个常规的主函数。主函数中的循环是推动异步操作完成的关键。
+
+
+
+
+这个函数非常简单。我们首先从 async_main 中获取返回的未来，然后在循环中调用对其的 poll，直到它返回 PollState::Ready。
+
+每次我们在返回中收到 PollState::NotReady 时，控制权会让给我们。如果我们愿意，我们可以在这里做其他工作，例如调度其他任务，但在我们的情况下，我们只是打印“调度其他任务”。
+
+我们还通过在每次调用时睡眠 100 毫秒来限制循环的运行频率。通过这种方式，我们不会被大量打印信息淹没，并且可以假设每次我们看到控制台打印“调度其他任务”之间大约有 100 毫秒的间隔。
+
+如果我们运行这个例子，我们将得到以下输出：
+
+程序启动
+第一次轮询 - 启动操作
+调度其他任务
+调度其他任务
+调度其他任务
+调度其他任务
+调度其他任务
+调度其他任务
+HTTP/1.1 200 OK
+content-length: 11
+connection: close
+content-type: text/plain; charset=utf-8
+date: Tue, 24 Oct 2023 20:39:13 GMT
+HelloWorld1
+第一次轮询 - 启动操作
+调度其他任务
+调度其他任务
+调度其他任务
+调度其他任务
+HTTP/1.1 200 OK
+content-length: 11
+connection: close
+content-type: text/plain; charset=utf-8
+date: Tue, 24 Oct 2023 20:39:13 GMT
+HelloWorld2
+通过查看这些打印输出，您可以大致了解程序的流程：
+
+首先，我们看到“程序启动”，这在协程开始时执行。
+接下来我们看到，立即进入“第一次轮询 - 启动操作”的消息，这只有在从 HTTP 客户端轮询返回的未来第一次时打印。
+然后，我们看到我们回到了主函数，此时理论上我们可以继续运行其他任务，如果我们有的话。
+每 100 毫秒，我们检查任务是否完成，并收到相同的消息，告诉我们可以调度其他任务。
+然后，在大约 600 毫秒后，我们收到了一个响应并将其打印出来。
+我们再重复一次这个过程，直到我们收到并打印出来自服务器的第二个响应。
+恭喜您，您现在创建了一个可以在不同点暂停和恢复的任务，使其能够进展。
+
+
+谁会想要像这样编写代码来完成一项简单任务呢？答案是没有人！
+是的，这有点夸张，但我敢猜测，当你把它与完成同样事情所需的 7 行正常顺序代码进行比较时，很少有程序员会喜欢编写 55 行状态机代码。
+
+如果我们回想一下大多数用户空间对并发操作的抽象目标，我们会发现这种做法只满足我们追求的三个目标中的一个：
+
+高效
+表达性
+易用且不易误用
+我们的状态机将是高效的，但仅此而已。
+然而，你也可能会注意到，这疯狂之中有条理。
+这可能并不令人惊讶，但我们写的代码如果用一些关键词标记每个函数的开始和我们想要将控制权返回给调用者的每一点，那么这些代码会简单得多，同时让我们的状态机为我们生成。这就是 async/await 的基本概念。
+
+让我们看看这在我们的例子中是如何工作的。
+
+async/await
+之前的例子可以简单地使用 async/await 关键字写成如下：
+
+async fn async_main() {
+    println!("程序启动");
+    let txt = Http::get("/1000/HelloWorld").await;
+    println!("{txt}");
+    let txt2 = Http::get("/500/HelloWorld2").await;
+    println!("{txt2}");
+}
+这仅需七行代码，看起来非常像你在普通子程序/函数中编写的代码。
+事实证明，我们可以让编译器为我们写这些状态机，而不是自己编写。
+不仅如此，我们还可以仅通过使用简单的宏获得很大的帮助，这正是当前 async/await 语法在成为语言一部分之前的原型开发方式。你可以在 这里 查看一个示例。
+
+当然，缺点是这些函数看起来像正常的子程序，但本质上却非常不同。
+对于像 Rust 这样的强类型语言，它使用借用语义而不是垃圾回收器，因此无法掩盖这些函数是不同的这一事实。
+这可能会给程序员造成一些困惑，因为他们期望所有东西都表现得一样。
+
+协程额外示例
+为了展示我们的例子与使用 std::future::Future 特征和 Rust 中的 async/await 所获得的行为有多接近，我创建了与我们刚刚在 a-coroutines 中所做的完全相同的示例，这次使用“正确的” futures 和 async/await 语法。你会注意到，代码只需非常小的更改。其次，你可以自己看到，输出显示的程序流程与我们手动编写状态机时的示例完全相同。你可以在仓库中的 ch07/a-coroutines-bonus 文件夹中找到这个示例。
+
+所以，让我们更进一步。
+为了避免混淆，由于我们的协程在此时只向调用函数让出控制权（目前还没有调度器、事件循环或类似的东西），我们使用一种稍微不同的语法，称为 coroutine/wait，并创建一种方法让这些状态机为我们生成。
+
+
+coroutine/wait 语法将与 async/await 语法有明显相似之处，尽管它的功能要有限得多。基本规则如下：
+
+每个以 coroutine 前缀的函数将被重写为一个状态机，就像我们之前编写的那样。
+标记为 coroutine 的函数的返回类型将被重写，以返回 -> impl Future<Output = String>（是的，我们的语法只处理输出为字符串的 futures）。
+只有实现了 Future 特征的对象才能以 .wait 结尾。这些点将作为我们的状态机中的独立阶段来表示。
+以 coroutine 为前缀的函数可以调用普通函数，但普通函数不能调用 coroutine 函数并期望会发生任何事情，除非它们重复调用 poll 直到返回 PollState::Ready。
+我们的实现将确保，如果我们编写以下代码，它将编译成我们在本章开头写的相同状态机（唯一的例外是所有协程将返回字符串）：
+
+coroutine fn async_main() {
+    println!("程序启动");
+    let txt = Http::get("/1000/HelloWorld").wait;
+    println!("{txt}");
+    let txt2 = Http::get("/500/HelloWorld2").wait;
+    println!("{txt2}");
+}
+但是等等。coroutine/wait 在 Rust 中并不是有效的关键词。如果我写这个，编译时会出错！
+
+你说得对。因此，我创建了一个名为 corofy 的小程序，它将 coroutine/wait 函数重写为这些状态机器。让我们快速解释一下。
+
+corofy—协程预处理器
+重写 Rust 代码的最佳方式是使用宏系统。缺点是，它的具体编译结果并不十分清晰，而展开宏的过程在我们的用例中并不理想，因为我们的主要目标之一是查看我们所写的代码与它转化成什么之间的差异。此外，除非你经常与宏打交道，否则宏可能会变得相当复杂，难以阅读和理解。
+
+相反，corofy 是一个普通的 Rust 程序，你可以在仓库中的 ch07/corofy 找到。如果你进入那个文件夹，你可以通过写下以下命令来全局安装该工具。
+
+
+cargo install --path .
+
+现在你可以在任何地方使用这个工具。它的工作方式是提供一个包含 coroutine/wait 语法的输入文件，例如 corofy ./src/main.rs [可选输出文件]。如果你不指定输出文件，它将在相同文件夹中创建一个以 _corofied 后缀命名的文件。
+
+注意
+
+该工具功能非常有限。诚实的原因是我想在到达2300年之前完成这个示例，并且我重写了整个 Rust 编译器，以提供使用 coroutine/wait 关键词的稳健体验。实际上，在没有访问 Rust 的类型系统的情况下，编写这样的转换是非常困难的。该工具的主要用例将在于转换我们在这里编写的示例，但它也可能适用于轻微变化的相同示例（例如，添加更多等待点或在每个等待点之间执行更有趣的任务）。有关其限制的更多信息，请查看 corofy 的 README。
+
+还有一件事：我假设你在今后的使用中未指定明确的输出文件，因此输出文件的名称将与输入文件相同，并以 _corofied 作为后缀。
+
+该程序读取你提供的文件并搜索 coroutine 关键字的使用情况。它将这些函数注释掉（因此它们仍然在文件中），将它们放到文件的最后，并直接在其下方写出状态机的实现，指出状态机的哪些部分是你实际在等待点之间编写的代码。
+
+现在我已经介绍了我们的新工具，是时候开始使用它了。
+
+b-async-await——协程/等待转换的示例
+
+让我们稍微扩展我们的示例。现在我们有了一个输出状态机的程序，因此更容易创建一些示例，并涵盖一些我们协程实现的更复杂部分。我们将以下示例基于与第一个示例完全相同的代码。在仓库中，你会在 ch07/b-async-await 找到这个示例。
+
+如果你从书中编写每个示例，而不依赖于仓库中现有的代码，你可以做两件事：
+
+继续修改第一个示例中的代码。
+创建一个名为 b-async-await 的新 cargo 项目，并将上一个示例中 src 文件夹的所有内容和 Cargo.toml 的依赖项部分复制到新项目中。
+无论你选择哪个，你面前应该都有相同的代码。让我们简单地将 main.rs 中的代码更改为这个：
+
+
+ch07/b-async-await/src/main.rs
+use std::time::Instant; 
+mod http; 
+mod future; 
+use future::*; 
+use crate::http::Http; 
+
+fn get_path(i: usize) -> String {     
+    format!("/{}/HelloWorld{i}", i * 1000) 
+} 
+
+coroutine fn async_main() {     
+    println!("程序开始");     
+    let txt = Http::get(&get_path(0)).wait;     
+    println!("{txt}");     
+    let txt = Http::get(&get_path(1)).wait;     
+    println!("{txt}");     
+    let txt = Http::get(&get_path(2)).wait;     
+    println!("{txt}");     
+    let txt = Http::get(&get_path(3)).wait;     
+    println!("{txt}");     
+    let txt = Http::get(&get_path(4)).wait;     
+    println!("{txt}"); 
+} 
+
+fn main() {     
+    let start = Instant::now();     
+    let mut future = async_main();     
+    loop {         
+        match future.poll() {             
+            PollState::NotReady => (),             
+            PollState::Ready(_) => break,         
+        }     
+    }     
+    println!("\n经过时间: {}", start.elapsed().as_secs_f32()); 
+}
+这段代码包含了一些更改。首先，我们添加了一个方便的函数 get_path，用于为我们的 GET 请求创建新的路径，以便根据我们传入的整数生成一个可以在 GET 请求中使用的带延迟和消息的路径。接下来，在我们的 async_main 函数中，我们创建了五个请求，延迟时间从 0 秒到 4 秒不等。我们在 main 函数中的最后更改是，不再在每次调用 poll 时打印消息，因此，我们不再使用 thread::sleep 来限制调用的数量。相反，我们测量从进入 main 函数到退出它的时间，因为我们可以使用这个时间来证明我们的代码是否并发运行。
+
+现在我们的 main.rs 看起来与前面的示例相同，我们可以使用 corofy 将其重写为状态机，所以假设我们在 ch07/b-async-await 的根文件夹中，我们可以写出以下内容。
+
+
+使用以下命令将 ./src/main.rs 转换为协程状态机：
+
+corofy ./src/main.rs
+这将生成一个名为 main_corofied.rs 的文件，位于 src 文件夹中，您可以打开并查看它。
+
+现在，您可以将 main_corofied.rs 文件中的所有内容复制到 main.rs 中。
+
+注意
+为了方便起见，项目根目录中有一个名为 original_main.rs 的文件，其中包含我们之前展示的 main.rs 的代码，因此您不需要保存 main.rs 的原始内容。如果您自己从书中复制每个示例到您自己的项目中，最好在覆盖之前将 main.rs 的原始内容保存到某个地方。
+
+我不会在这里展示整个状态机，因为使用 coroutine/wait 的 39 行代码编写为状态机时会变成 170 行代码，但我们的 State 枚举现在看起来像这样：
+
+enum State0 {     
+    Start,     
+    Wait1(Box<dyn Future<Output = String>>),     
+    Wait2(Box<dyn Future<Output = String>>),     
+    Wait3(Box<dyn Future<Output = String>>),     
+    Wait4(Box<dyn Future<Output = String>>),     
+    Wait5(Box<dyn Future<Output = String>>),     
+    Resolved, 
+}
+如果您使用 cargo run 来运行程序，您现在会得到以下输出：
+
+程序启动
+首次轮询 - 开始操作
+HTTP/1.1 200 OK
+content-length: 11
+connection: close
+content-type: text/plain; charset=utf-8
+date: Tue, xx xxx xxxx 21:05:55 GMT
+HelloWorld0
+
+首次轮询 - 开始操作
+HTTP/1.1 200 OK
+content-length: 11
+connection: close
+content-type: text/plain; charset=utf-8
+date: Tue, xx xxx xxxx 21:05:56 GMT
+HelloWorld1
+
+首次轮询 - 开始操作
+HTTP/1.1 200 OK
+content-length: 11
+connection: close
+content-type: text/plain; charset=utf-8
+date: Tue, xx xxx xxxx 21:05:58 GMT
+HelloWorld2
+
+首次轮询 - 开始操作
+HTTP/1.1 200 OK
+content-length: 11
+connection: close
+content-type: text/plain; charset=utf-8
+date: Tue, xx xxx xxxx 21:06:01 GMT
+HelloWorld3
+
+首次轮询 - 开始操作
+HTTP/1.1 200 OK
+content-length: 11
+connection: close
+content-type: text/plain; charset=utf-8
+date: Tue, xx xxx xxxx 21:06:05 GMT
+HelloWorld4
+
+经过时间：10.043025
+
+所以，您可以看到我们的代码按预期运行。由于我们对每次调用 Http::get 都调用了 wait，代码按顺序执行，这在经过时间为10秒的时候显而易见。这是有道理的，因为我们要求的延迟是 
+0
++
+1
++
+2
++
+3
++
+4
+0+1+2+3+4，它等于 10 秒。 如果我们希望我们的 futures 并发运行呢？您还记得我们谈到这些 futures 是懒惰的吗？很好。所以，您知道仅仅创建一个 future 并不能实现并发。我们需要对它们进行轮询以开始操作。
+
+为了解决这个问题，我们受到了 Tokio 的启发，创建了一个名为 join_all 的函数，它接受一个 futures 集合，并使它们全部并发完成。这里是我们为本章创建的最后一个例子：
+
+c-async-await—并发 futures
+好的，所以我们将基于上一个例子做同样的事情。创建一个新的项目，称为 c-async-await，并将 Cargo.toml 和 src 文件夹中的所有内容复制过来。
+
+我们首先要做的是转到 future.rs，并在现有代码下方添加 join_all 函数：
+
+pub fn join_all<F: Future>(futures: Vec<F>) -> JoinAll<F> {     
+    let futures = futures.into_iter().map(|f| (false, f)).collect();     
+    JoinAll {         
+        futures,         
+        finished_count: 0,     
+    } 
+}
+这个函数将一个 futures 集合作为参数，并返回一个 JoinAll<F> future。该函数简单地创建了一个新集合。在这个集合中，我们将包含由接收到的原始 futures 和一个 bool 值（指示 future 是否已解析）组成的元组。
+
+接下来是我们的 JoinAll 结构的定义：
+
+pub struct JoinAll<F: Future> {     
+    futures: Vec<(bool, F)>,     
+    finished_count: usize, 
+}
+这个结构将简单地存储我们创建的集合和一个 finished_count。最后一个字段将使我们更容易跟踪有多少 futures 已被解析。
+
+像我们现在习惯的那样，大多数有趣的部分就在 JoinAll 的 Future 实现中。
+
+
+impl<F: Future> Future for JoinAll<F> {
+    type Output = String;
+
+    fn poll(&mut self) -> PollState<Self::Output> {
+        for (finished, fut) in self.futures.iter_mut() {
+            if *finished {
+                continue;
+            }
+            match fut.poll() {
+                PollState::Ready(_) => {
+                    *finished = true;
+                    self.finished_count += 1;
+                }
+                PollState::NotReady => continue,
+            }
+        }
+        if self.finished_count == self.futures.len() {
+            PollState::Ready(String::new())
+        } else {
+            PollState::NotReady
+        }
+    }
+}
+我们将 Output 设置为 String。这可能会让你感到奇怪，因为我们实际上并没有从这个实现中返回任何东西。原因在于 corofy 只会与返回 String 的 futures 一起工作（这是它的许多缺点之一），所以我们只是接受这一点，并在完成时返回一个空字符串。
+
+接下来是我们的轮询实现。我们首先要做的是遍历每个（标志，future）元组：
+
+for (finished, fut) in self.futures.iter_mut()
+在循环内部，我们首先检查这个 future 的标志是否已设置为完成。如果是，我们就简单地转到集合中的下一个项目。如果它还没有完成，我们就轮询这个 future。
+
+如果我们得到了 PollState::Ready，我们就将这个 future 的标志设置为 true，这样我们就不会再对它进行轮询，并且我们增加已完成的计数。
+
+注意 值得注意的是，我们在这里创建的 join_all 实现将不会以任何有意义的方式与返回值的 futures 一起工作。在我们的情况下，我们只是丢弃这个值，但请记住，我们现在只是想保持尽可能简单，唯一想展示的就是调用 join_all 的并发性方面。
+
+Tokio 的 join_all 实现会将所有返回的值放入 Vec<T> 中，并在 JoinAll future 解析时返回它们。
+
+如果我们得到了 PollState::NotReady，我们就简单地继续下一个集合中的 future。
+
+在遍历完整个集合后，我们检查是否已经解析了我们最初收到的所有 futures：
+
+if self.finished_count == self.futures.len()
+如果所有 futures 都已解析，我们就返回 PollState::Ready，并返回一个空字符串（以让 corofy 满意）。如果仍然有未解析的 futures，我们就返回 PollState::NotReady。
+
+
+这里有一点微妙之处需要注意。第一次调用 JoinAll::poll 时，它将对集合中的每个 future 调用 poll。轮询每个 future 将启动它们所代表的操作，并允许它们并发进展。这是一种实现懒惰协程并发性的方法，比如我们在这里处理的这些协程。
+
+接下来是我们将在 main.rs 中进行的更改。主函数将保持不变，文件开头的导入和声明也将相同，因此我只会展示我们更改过的协程/等待函数：
+
+协程 fn request(i: usize) {
+    let path = format!("/{}/HelloWorld{i}", i * 1000);
+    let txt = Http::get(&path).wait;
+    println!("{txt}");
+}
+
+协程 fn async_main() {
+    println!("程序启动");
+    let mut futures = vec![];
+    for i in 0..5 {
+        futures.push(request(i));
+    }
+    future::join_all(futures).wait;
+}
+注意
+在存储库中，如果您在进行复制和粘贴时不幸迷失了方向，您可以在 ch07/c-async-await/original_main.rs 中找到正确的代码以放入 main.rs。
+
+现在我们有了两个协程/等待函数。async_main 将由 read_request 创建的一组协程存储在 Vec<T: Future> 中。然后，它创建一个 JoinAll future 并对其调用 wait。
+
+下一个协程/等待函数是 read_requests，它接受一个整数作为输入，并利用这个整数创建 GET 请求。这个协程将等待响应，并在结果到达时打印输出。
+
+由于我们以 0、1、2、3、4 秒的延迟创建请求，因此我们应该期望整个程序在略超过四秒内完成，因为所有任务将并发进行。短延迟的任务将在四秒延迟的任务完成之前结束。
+
+现在我们可以通过确保工作目录在 ch07/c-async-await 中，并写入 corofy ./src/main.rs 来将协程/等待函数转换为状态机。
+
+现在您应该在 src 文件夹中看到一个名为 main_corofied.rs 的文件。复制其内容并用它替换 main.rs 中的内容。
+
+如果您通过输入 cargo run 来运行程序，您应该会看到以下输出。
+
+程序启动
+第一次轮询 - 启动操作
+第一次轮询 - 启动操作
+第一次轮询 - 启动操作
+第一次轮询 - 启动操作
+第一次轮询 - 启动操作
+
+HTTP/1.1 200 OK
+content-length: 11
+connection: close
+content-type: text/plain; charset=utf-8
+date: Tue, xx xxx xxxx 21:11:36 GMT
+HelloWorld0
+
+HTTP/1.1 200 OK
+content-length: 11
+connection: close
+content-type: text/plain; charset=utf-8
+date: Tue, xx xxx xxxx 21:11:37 GMT
+HelloWorld1
+
+HTTP/1.1 200 OK
+content-length: 11
+connection: close
+content-type: text/plain; charset=utf-8
+date: Tue, xx xxx xxxx 21:11:38 GMT
+HelloWorld2
+
+HTTP/1.1 200 OK
+content-length: 11
+connection: close
+content-type: text/plain; charset=utf-8
+date: Tue, xx xxx xxxx 21:11:39 GMT
+HelloWorld3
+
+HTTP/1.1 200 OK
+content-length: 11
+connection: close
+content-type: text/plain; charset=utf-8
+date: Tue, xx xxx xxxx 21:11:40 GMT
+HelloWorld4
+
+经过时间: 4.0084987
+
+这里需要注意的是经过的时间。现在刚刚超过四秒了，这正是我们预期的，因为我们的 futures 是并发运行的。
+
+如果我们查看协程/等待如何改变了程序员编写协程的体验，我们会发现我们现在离目标更近了：
+
+高效：状态机不需要上下文切换，只需保存/恢复与特定任务相关的数据。我们没有增长与分段堆栈的问题，因为它们都使用相同的操作系统提供的堆栈。
+表现力强：我们可以像在“正常” Rust 中那样编写代码，并且通过编译器支持，我们可以获得相同的错误消息，并使用相同的工具。
+易于使用且难以误用：这一点可能略低于典型的纤程/绿色线程实现，原因在于我们的程序在编译器的“幕后”被大量转换，这可能导致一些粗糙的边缘。具体来说，您不能从普通函数中调用异步函数并期望得到任何有意义的结果；您必须以某种方式主动轮询它直到完成，随着我们开始将运行时添加到混合中，这变得更加复杂。然而，在大多数情况下，我们可以像以往一样编写程序。
+最后的想法
+在结束这一章之前，我想指出，现在应该清楚为什么协程并不真正是可抢占的。如果你还记得在第二章中，我们说过一个带栈的协程（例如我们的纤程/绿色线程示例）可以被抢占，并且它的执行可以被暂停。
+
+
+在这里，这不可能。我们唯一可以停止和恢复执行的地方是我们手动标记为等待的预定义暂停点。
+
+理论上，如果您拥有一个紧密集成的系统，您控制编译器、协程定义、调度程序和 I/O 原语，您可以向状态机添加额外的状态，并创建可以暂停/恢复任务的其他点。这些暂停点对用户是模糊的，并且与正常的等待/暂停点处理方式不同。
+
+例如，每当您遇到一个普通函数调用时，您可以添加一个暂停点（我们状态机中的一个新状态），在该点检查调度程序当前任务是否耗尽了其时间预算或类似的东西。如果是这样，您可以安排另一个任务运行，并在稍后的时间恢复该任务，尽管这不是以协作的方式发生的。
+
+然而，即使这对用户是不可见的，它也不等同于能够在代码的任何点停止/恢复执行。这也违背了通常暗示的协程的协作性质。
+
+总结
+干得好！在这一章中，我们介绍了相当多的代码，并建立了一个我们将在接下来的章节中继续使用的示例。
+
+到目前为止，我们关注 futures 和 async/await，以建模和创建可以在特定点暂停和恢复的任务。我们知道，这是让多个任务同时进行的先决条件。我们通过引入自己的简化 Future 特征和自己的协程/等待语法来实现这一点，这比 Rust 的 futures 和 async/await 语法要有限得多，但更容易理解，并能清晰地展现出与纤程/绿色线程的对比（至少我希望如此）。
+
+我们还讨论了急切和延迟协程之间的区别以及它们如何影响并发的实现。我们从 Tokio 的 join_all 函数中获得灵感，并实现了自己的版本。
+
+在这一章中，我们简单创建了可以暂停和恢复的任务。还没有事件循环、调度或其他任何内容，但请不要担心。这正是我们将在下一章中讨论的内容。好消息是，像我们在这一章中那样明确理解协程，是最困难的事情之一。
+
+# 8. 运行时、唤醒器和反应器-执行者模式
+
+在上一章中，我们通过将可暂停任务（协程）编写为状态机来创建我们自己的可暂停任务。我们通过要求这些任务实现 Future 特征来为这些任务创建一个公共 API。我们还展示了如何使用一些关键字创建这些协程，并以编程方式重写它们，这样我们就不必手动实现这些状态机，而是尽可能以我们通常编写程序的方式来编写。
+
+如果我们停下来片刻，从宏观的角度来看我们迄今为止所获得的东西，概念上非常简单：我们有一个用于可暂停任务的接口（Future 特征），还有两个关键字（协程/等待）来指示我们希望重写为状态机的代码段，以将我们的代码分割为我们可以在其中暂停的段落。
+
+然而，我们没有事件循环，也还没有调度程序。在这一章中，我们将扩展我们的示例，添加一个可以高效运行程序的运行时，并开启更高效地并发调度任务的可能性。
+
+本章将带你进行一段旅程，我们将分两个阶段实现我们的运行时，逐步使其更加有用、高效和强大。我们将开始简要概述什么是运行时，以及为什么我们想了解一些其特性的原因。我们将基于在第七章中学到的内容，展示如何使其更加高效，避免通过利用第四章获得的知识持续轮询来推进 future。
+
+接下来，我们将展示如何通过将运行时分为两个部分来获得更灵活和松散耦合的设计：执行者和反应器。
+
+在这一章中，您将学习基本的运行时设计、反应器、执行者、唤醒器和生成等内容，并且我们将建立在本书中获得的大量知识基础之上。这将是本书中的一个重要章节，并非因为主题过于复杂或困难，而是因为我们需要写出相当多的代码。除此之外，我会通过提供相当多的图示和详细解释，给您一个良好的心理模型，让您理解所发生的事情。不过，这并不是那种您通常在睡前快速浏览的章节，但我确实保证，最后绝对值得。
+
+本章将被划分为以下几个部分：
+
+运行时简介及其必要性
+改进我们基本示例
+创建一个适当的运行时
+第一步：通过添加反应器和唤醒器来改进我们的运行时设计
+第二步：实现一个适当的执行者
+第三步：实现一个适当的反应器
+实验我们的新运行时
+那么，让我们直接开始吧！
+
+技术要求
+本章中的示例将基于上一章的代码，因此要求相同。所有示例都将是跨平台的，并在 Rust（Rust 平台支持）和 mio（mio 平台支持）支持的所有平台上运行。您所需的唯一条件是安装 Rust，并在本地下载属于本书的代码库。本章中的所有代码都将在 ch08 文件夹中找到。
+
+为了逐步跟随示例，您还需要在机器上安装 corofy。如果您在第七章中没有安装，请现在前往代码库的 ch08/corofy 文件夹并运行以下命令：
+
+
+
+cargo install --force --path .
+另外，当我们到达使用 corofy 重写我们的协程/等待语法的部分时，您也可以直接复制代码库中的相关文件。那时，两种版本都会为您提供。
+
+我们还将在这个示例中使用 delayserver，因此您需要打开一个单独的终端，进入代码库根目录下的 delayserver 文件夹，并输入 cargo run，以便为接下来的示例做好准备。如果您因某种原因需要更改 delayserver 侦听的端口，请记得在代码中更改端口。
+
+运行时简介及其必要性
+如您所知，您需要为 Rust 的异步任务调度和驱动提供自己的运行时。运行时有许多种类，从流行的 Embassy 嵌入式运行时（Embassy），它更侧重于通用的多任务处理，并且在许多平台上可以替代实时操作系统（RTOS），到 Tokio（Tokio），它专注于流行的服务器和桌面操作系统上的非阻塞 I/O。
+
+Rust 中的所有运行时至少需要完成两项任务：调度和驱动实现 Rust 的 Future 特性的对象，以完成任务。在本章接下来的部分中，我们将主要关注在流行的桌面和服务器操作系统（如 Windows、Linux 和 macOS）上执行非阻塞 I/O 的运行时。这也是大多数程序员在 Rust 中遇到的最常见的运行时类型。
+
+控制任务的调度是一种非常强侵入性的操作，这几乎是一条单行路。如果您依赖用户空间调度器来运行您的任务，您不能同时使用操作系统调度器（除非经历几重困难），因为在您的代码中混合使用它们将造成混乱，并可能最终使编写异步程序的整个目的失效。
+
+以下的图表说明了不同的调度器：
+
+图 8.1 – 单线程异步系统中的任务调度
+
+一个例子是通过使用默认的 std::net::TcpStream 或 std::thread::sleep 方法进行阻塞调用来让渡给操作系统调度器。即使是使用标准库提供的诸如 Mutex 这类原语的潜在阻塞调用，也可能会让渡给操作系统调度器。这就是为什么你会发现异步编程往往会影响其所触及的所有内容，而且仅仅用 async/await 运行程序的一部分是困难的。
+
+因此，运行时必须使用标准库的非阻塞版本。理论上，你可以制作一个所有运行时都使用的标准库的非阻塞版本，这也是 async_std 倡议的目标之一（async_std）。然而，让社区达成一致来解决这个任务是一个艰巨的任务，并且到目前为止还未真正实现。
+
+在我们开始实现示例之前，我们将讨论 Rust 中典型异步运行时的整体设计。大多数运行时，如 Tokio、Smol 或 async-std，通常将其运行时分为两个部分。
+
+负责跟踪我们等待的事件，并确保有效地等待操作系统通知的部分通常称为反应器（reactor）或驱动程序（driver）。负责调度任务并轮询它们完成的部分称为执行器（executor）。让我们从高层次上看一下这个设计，以便我们知道将在示例中实现哪些内容。
+
+反应器和执行器
+将运行时分为两个不同部分是合理的，当我们着眼于 Rust 如何建模异步任务时。如果你阅读 Future（Future）和 Waker（Waker）的文档，你会看到 Rust 不仅定义了 Future 特性和 Waker 类型，而且还附带了有关它们如何使用的重要信息。
+
+
+一个例子是，正如我们在第六章中讨论的，Future 特性是惰性的。另一个例子是，对 Waker::wake 的调用将确保至少对相应任务的 Future::poll 进行一次调用。因此，仅通过阅读文档，你就会发现至少有一些思考放在了运行时的行为上。
+
+学习这个模式的原因在于，它几乎完美契合了 Rust 的异步模型。由于很多读者，包括我自己，英语并不是母语，我将在此开始解释这些名称，因为它们似乎容易被误解。如果“反应器”这个名字让你联想到核反应堆，并且你开始认为反应器是驱动或支持运行时的东西，请立即放弃这个想法。反应器只是对一整套传入事件作出反应并逐个将其分配给处理程序的东西。它是一个事件循环，在我们这里，它将事件分发到执行器。反应器处理的事件可以是任何东西，从到期的定时器、如果你为嵌入式系统编写程序的中断，或者诸如 TcpStream 上的可读事件这样的 I/O 事件。你可以在同一个运行时中有几种类型的反应器。
+
+如果“执行器”这个名字让你联想到执行者（中世纪那个意思）或可执行文件，也请放弃这个想法。如果你查找执行器是什么，它是一个人，通常是一个律师，负责管理一个人的遗嘱。通常情况下，那个人已经去世。这也是这个命名给你带来的心理模型崩溃的地方，因为在异步运行时中，执行器的工作没有人会受到伤害，但我偏题了。重要的是，执行器简单地决定谁在 CPU 上获得时间来进展以及何时获得。执行器还必须调用 Future::poll，并将状态机推进到下一个状态。它是一种调度器。
+
+从一开始就产生错误的想法可能会令人沮丧，因为这个主题已经足够复杂，而不必思考核反应堆和执行者如何在整个画面中适应。由于反应器将响应事件，因此它们需要与事件来源进行某种集成。如果我们继续使用 TcpStream 作为例子，某些东西将对其调用读或写，此时反应器需要知道它应该跟踪该来源上的某些事件。
+
+因此，非阻塞 I/O 原语和反应器需要紧密集成，具体取决于你的看法，I/O 原语要么必须带上自己的反应器，要么你需要一个提供套接字、端口和流等 I/O 原语的反应器。
+
+现在我们已经覆盖了一些总体设计，我们可以开始编写一些代码。运行时往往会快速变得复杂，因此为了尽可能简单，我们将避免代码中的任何错误处理，并对所有内容使用 unwrap 或 expect。我们还将选择简单而不是聪明，并尽可能优先考虑可读性而非效率。
+
+我们的第一个任务是回顾我们在第七章中写的第一个示例，通过避免必须主动轮询它来改进它。相反，我们依赖于之前章节中关于非阻塞 I/O 和 epoll 的知识。
+
+
+改进我们的基础示例
+
+我们将创建第七章中第一个示例的一个版本，因为这是最简单的开始。我们唯一关注的是展示如何更有效地安排和驱动运行时。
+
+我们从以下步骤开始：
+
+创建一个新项目，命名为 a-runtime （或者导航到书籍仓库中的 ch08/a-runtime）。
+
+将我们在第七章创建的第一个项目 a-coroutine 中 src 文件夹中的 future.rs 和 http.rs 文件复制到我们新项目的 src 文件夹中（或者从书籍仓库中复制 ch07/a-coroutine 的文件）。
+
+确保通过在 Cargo.toml 中添加以下内容将 mio 添加为依赖项：
+
+[dependencies]
+mio = { version = "0.8", features = ["net", "os-poll"] }
+在 src 文件夹中创建一个名为 runtime.rs 的新文件。我们将使用 corofy 将以下 coroutine/wait 程序转换为我们可以运行的状态机表示。 在 src/main.rs 中，添加以下代码：
+
+mod future;
+mod http;
+mod runtime;
+
+use future::{Future, PollState};
+use runtime::Runtime;
+
+fn main() {
+    let future = async_main();
+    let mut runtime = Runtime::new();
+    runtime.block_on(future);
+}
+
+coroutine fn async_main() {
+    println!("Program starting");
+    let txt = http::Http::get("/600/HelloAsyncAwait").wait;
+    println!("{txt}");
+    let txt = http::Http::get("/400/HelloAsyncAwait").wait;
+    println!("{txt}");
+}
+这个程序基本上和我们在第七章创建的程序相同，只是这次我们是通过 coroutine/wait 语法创建它，而不是手动编写状态机。接下来，我们需要使用 corofy 将其转换为代码，因为编译器无法识别我们自己的 coroutine/wait 语法。
+
+如果你在 a-runtime 的根文件夹中，运行 corofy ./src/main.rs。
+你现在应该有一个名为 main_corofied.rs 的文件。
+删除 main.rs 中的代码，并将 main_corofied.rs 的内容复制到 main.rs 中。
+现在你可以删除 main_corofied.rs，因为我们在后续中不需要它。
+如果一切正确，项目结构现在应该看起来如下：
+
+src
+  |-- future.rs
+  |-- http.rs
+  |-- main.rs
+  |-- runtime.rs
+提示：你可以随时参考书籍的仓库以确保一切正确。正确的示例位于 ch08/a-runtime 文件夹中。在仓库中，你还会找到一个名为 main_orig.rs 的文件，在根文件夹中包含 coroutine/wait 程序，如果你想重新运行它或出现问题时需要用到它。
+
+
+设计
+在我们继续之前，让我们可视化一下我们的系统当前是如何工作的，如果我们考虑它的结构包含两个由 coroutine/wait 创建的 futures 和两个对 Http::get 的调用。在主函数中，负责将我们的 Future 特性轮询到完成的循环，扮演了我们可视化中的执行器的角色。在这个结构中，我们可以看到一系列的 futures，包括：
+
+由 async/await（或在我们示例中是 coroutine/wait）创建的非叶子 futures，它们简单地调用下一个 future 的 poll，直到到达一个叶子 future。
+叶子 futures 会轮询一个实际的源，该源的状态是 Ready 或 NotReady。
+以下的图表展示了我们当前设计的简化概述。
+
+图8.2 – 执行器和 futures 链：当前设计
+如果我们仔细观察 futures 链，我们可以看到当一个 future 被轮询时，它会轮询所有的子 futures，直到到达一个实际在等待的叶子 future。如果那个 future 返回 NotReady，它会立即将该状态传播到链的上方。然而，如果它返回 Ready，状态机将会一直推进，直到下一个 future 返回 NotReady。顶层的 future 直到所有子 futures 都返回 Ready 才会解决。
+
+下一个图表更详细地观察 futures 链，并提供其工作原理的简化概述。
+
+图8.3 – Futures 链：详细视图
+我们要进行的第一个改进是避免持续轮询顶层 future 来推动其前进。我们将改变设计，使其更像这样：
+
+图8.4 – 执行器和 Futures 链：设计 2
+在这个设计中，我们利用了第四章中获得的知识，但我们将不再仅仅依赖于 epoll，而是使用 mio 的跨平台抽象。它的工作原理我们应该已经非常熟悉，因为我们之前已经实现了其简化版本。
+
+我们将不再持续循环和轮询顶层 future，而是向 Poll 实例注册兴趣，当我们获得 NotReady 的结果时，我们将等待 Poll。这将使线程进入休眠状态，直到操作系统再次唤醒我们以通知等待的事件已经准备好。在这个设计中效率和可扩展性将大大提升。
+
+更改当前实现
+现在我们已经对设计有了概述，并知道了需要做什么，我们可以继续对程序进行必要的更改，所以我们来看看需要更改的每个文件。我们将从 main.rs 开始。
+
+main.rs
+在我们运行更新后的 coroutine/wait 示例时，已经对 main.rs 进行了某些更改。我会在这里指出这个变化，以免你错过，因为这里实际上没有其他需要更改的地方。我们不再在主函数中轮询 future，而是创建了一个新的 Runtime 结构，并将 future 作为参数传递给 Runtime::block_on 方法。这个文件中无需再做其他更改。我们的主函数变成了：
+
+fn main() {
+    let future = async_main();
+    let mut runtime = Runtime::new();
+    runtime.block_on(future);
+}
+我们在主函数中的逻辑现在已经迁移到了运行时模块中，而我们也需要在这里更改轮询 future 完成的代码。
+
+下一步，将是打开 runtime.rs。
+
+runtime.rs
+我们在 runtime.rs 中的第一件事是引入所需的依赖：
+
+use crate::future::{Future, PollState};
+use mio::{Events, Poll, Registry};
+use std::sync::OnceLock;
+下一步是创建一个名为 REGISTRY 的静态变量。如果你还记得，Registry 是我们在 Poll 实例中注册事件兴趣的方式。我们希望在进行实际的 HTTP GET 请求时，注册我们 TcpStream 的事件兴趣。我们本可以让 Http::get 接受一个 Registry 结构，存储以便稍后使用，但我们希望保持 API 干净，而是想在 HttpGetFuture 中访问 Registry，而不需要将其作为引用传递：
+
+static REGISTRY: OnceLock<Registry> = OnceLock::new();
+
+pub fn registry() -> &'static Registry {
+    REGISTRY.get().expect("Called outside a runtime context")
+}
+我们使用 std::sync::OnceLock 来初始化 REGISTRY，当运行时启动时，防止任何人（包括我们自己）在没有 Runtime 实例的情况下调用 Http::get。
+
+
+
+在运行时，如果我们在没有初始化运行时的情况下调用 Http::get，将会发生 panic，因为唯一能够在运行时模块外部访问的公共方法是通过 pub fn registry(){…} 函数，而该调用将失败。
+
+注意
+我们本可以使用标准库中的 thread_local! 宏创建一个线程局部静态变量，但当我们在本章后面扩展示例时，需要从多个线程访问，因此我们在设计时考虑了这一点。
+
+接下来我们添加一个 Runtime 结构：
+
+pub struct Runtime {
+    poll: Poll,
+}
+目前，我们的运行时仅存储一个 Poll 实例。值得注意的部分在于 Runtime 的实现。由于它并不长，我将在这里全部呈现并进行解释：
+
+impl Runtime {
+    pub fn new() -> Self {
+        let poll = Poll::new().unwrap();
+        let registry = poll.registry().try_clone().unwrap();
+        REGISTRY.set(registry).unwrap();
+        Self { poll }
+    }
+
+    pub fn block_on<F>(&mut self, future: F)
+    where
+        F: Future<Output = String>,
+    {
+        let mut future = future;
+        loop {
+            match future.poll() {
+                PollState::NotReady => {
+                    println!("Schedule other tasks\n");
+                    let mut events = Events::with_capacity(100);
+                    self.poll.poll(&mut events, None).unwrap();
+                }
+                PollState::Ready(_) => break,
+            }
+        }
+    }
+}
+我们首先创建一个新的函数。这将初始化我们的运行时并设置我们需要的所有内容。我们创建了一个新的 Poll 实例，并从这个 Poll 实例中获取注册表的拥有版本。如果你还记得第四章，这是我们提到过但在示例中没有实现的方法。不过在这里，我们利用了将两个部分分开的能力。
+
+我们将 Registry 存储在全局变量 REGISTRY 中，以便稍后从 http 模块访问，而不需要有对运行时本身的引用。
+
+接下来的函数是 block_on 函数。我会逐步解释：
+
+首先，该函数接受一个泛型参数，并将在实现我们 Future 特征的任何内容上阻塞，且输出类型为 String（记住，目前这是我们支持的唯一 Future 特征类型，因此如果没有要返回的数据，我们将只返回一个空字符串）。
+
+我们不再需要将 mut future 作为参数，而是在函数体内声明一个变量并将其视作 mut。这样做只是为了保持 API 略微简洁，并避免我们在后续需要进行小改动。
+
+然后，我们创建一个循环。我们将循环，直到接收到的顶层 future 返回 Ready。如果 future 返回 NotReady，我们会输出一条消息，让我们知道此时可以做其他事情，例如处理与 future 无关的内容，或者更可能的是，轮询另一个顶层 future（如果我们的运行时支持多个顶层 future，别担心 – 后面会解释这一点）。
+
+注意，我们需要将事件集合传递给 mio 的 Poll::poll 方法，但由于只有一个顶层 future 需要执行，所以我们并不太关心发生了哪个事件；我们只关心已经有某些事情发生，并且这很可能意味着数据已就绪（记住 – 我们总需要考虑虚假唤醒）。
+
+这就是目前我们需要对运行时模块进行的所有更改。
+
+接下来，我们需要在 http 模块中向服务器写入请求后，注册读取事件的兴趣。
+
+让我们打开 http.rs，进行一些更改。
+
+http.rs
+首先，让我们调整我们的依赖，以便引入所需的一切：
+
+use crate::{future::PollState, runtime, Future};
+use mio::{Interest, Token};
+use std::io::{ErrorKind, Read, Write};
+我们需要为我们运行时模块添加依赖，以及一些来自 mio 的类型。
+
+在这个文件中我们只需再做一次更改，那就是在 Future::poll 的实现中，因此让我们去找一下：
+
+我们在这里做了一项重要的更改，我已为你标出。实现和之前完全相同，但有一个重要的区别：
+
+
+ch08/a-runtime/src/http.rs
+```rust
+impl Future for HttpGetFuture {
+    type Output = String;
+
+    fn poll(&mut self) -> PollState<Self::Output> {
+        if self.stream.is_none() {
+            println!("FIRST POLL - START OPERATION");
+            self.write_request();
+            runtime::registry()
+                .register(self.stream.as_mut().unwrap(), Token(0), Interest::READABLE)
+                .unwrap();
+        }
+
+        let mut buff = vec![0u8; 4096];
+        loop {
+            match self.stream.as_mut().unwrap().read(&mut buff) {
+                Ok(0) => {
+                    let s = String::from_utf8_lossy(&self.buffer);
+                    break PollState::Ready(s.to_string());
+                }
+                Ok(n) => {
+                    self.buffer.extend(&buff[0..n]);
+                    continue;
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    break PollState::NotReady;
+                }
+                Err(e) => panic!("{e:?}"),
+            }
+        }
+    }
+}
+```
+
+在第一次轮询中，在我们发送请求后，我们对这个 TcpStream 注册了对可读事件的兴趣。我们还移除了这行代码：return PollState::NotReady; 通过移除此行，当我们立即收到响应时，我们将立即对 TcpStream 进行轮询，这有道理，因为如果我们立即获得响应，我们并不希望将控制权返回给调度器。在这种情况下，您不会出错，因为我们将 TcpStream 注册为事件源，并会在任何情况下得到唤醒。这些更改是我们需要的最后一部分，以使我们的示例重新运行。
+
+如果您还记得第7章中的版本，我们得到了以下输出：
+
+程序启动
+第一次轮询 - 启动操作
+安排其他任务
+安排其他任务
+安排其他任务
+安排其他任务
+安排其他任务
+安排其他任务
+安排其他任务
+HTTP/1.1 200 OK
+content-length: 11
+connection: close
+content-type: text/plain; charset=utf-8
+date: Thu, 16 Nov xxxx xx:xx:xx GMT
+HelloWorld1
+第一次轮询 - 启动操作
+安排其他任务
+安排其他任务
+安排其他任务
+安排其他任务
+安排其他任务
+HTTP/1.1 200 OK
+content-length: 11
+connection: close
+content-type: text/plain; charset=utf-8
+date: Thu, 16 Nov xxxx xx:xx:xx GMT
+HelloWorld2
+在我们新的改进版本中，如果我们用 cargo run 运行它，我们会得到以下输出：
+
+程序启动
+第一次轮询 - 启动操作
+安排其他任务
+HTTP/1.1 200 OK
+content-length: 11
+connection: close
+content-type: text/plain; charset=utf-8
+date: Thu, 16 Nov xxxx xx:xx:xx GMT
+HelloAsyncAwait
+第一次轮询 - 启动操作
+安排其他任务
+HTTP/1.1 200 OK
+content-length: 11
+connection: close
+content-type: text/plain; charset=utf-8
+date: Thu, 16 Nov xxxx xx:xx:xx GMT
+HelloAsyncAwait
+注意，如果您在 Windows 上运行该示例，您会看到在每次之后出现两个“安排其他任务”消息。原因是 Windows 在服务器端丢弃 TcpStream 时会发出额外的事件。这在 Linux 上不会发生。过滤这些事件相对简单，但我们不会在示例中集中讨论这个问题，因为这更像是一种优化，而不是为了让我们的示例正常工作所必需的。
+
+需要注意的是我们打印了多少次“安排其他任务”消息。每次我们轮询并得到 NotReady 时都会打印此消息。在第一个版本中，我们每 100 毫秒打印一次，但这只是因为我们必须在每次休眠时延迟，以避免打印信息过多而造成的 overload。否则，我们的 CPU 将 100% 工作在轮询未完成的操作上。
+
+如果我们增加延迟，即使我们将延迟设置得远低于 100 毫秒，我们也会引入额外的延迟，因为我们无法立即响应事件。我们的新设计确保我们在事件准备好时立即做出响应，并且我们没有进行不必要的工作。因此，通过进行这些小的更改，我们已经创建了一个比之前好得多且更具可扩展性的版本。这个版本是完全单线程的，这使事情维持简单，同时避免了复杂性和同步开销。
+
+当您使用 Tokio 的当前线程调度程序时，您会得到一个基于我们在这里展示的相同理念的调度程序。然而，我们当前实现的确存在一些缺点，其中最明显的是它需要在以 Poll 为中心的运行时的反应器部分与执行器部分之间进行非常紧密的集成。我们希望在没有工作可做的时候将控制权让渡给操作系统调度器，并在事件发生时由操作系统唤醒我们，以便我们可以继续。在我们当前的设计中，这是通过在 Poll::poll 上阻塞来完成的。因此，执行器（调度器）和反应器都必须了解 Poll。缺点是，如果您创建了一个完美适合特定用例的执行器，并希望允许用户使用一个不依赖于 Poll 的不同反应器，那您就无法做到。
+
+更重要的是，您可能想要运行多个不同的反应器，以不同的理由唤醒执行器。您可能会发现存在一些 mio 不支持的内容，因此您创建了一个不同的反应器来处理这些任务。当执行器在 mio::Poll::poll(...) 上阻塞时，它们该如何唤醒执行器呢？
+
+举几个例子，您可以使用一个单独的反应器来处理计时器（例如，当您想让一个任务休眠一段时间时），或者您可能想要实现一个线程池来处理 CPU 密集型或阻塞任务作为反应器，当任务准备好时唤醒相应的 future。为了解决这些问题，我们需要在运行时的反应器和执行器部分之间进行较松散的耦合，通过一种不会紧密耦合于单个反应器实现的方式来唤醒执行器。让我们看看如何通过创建更好的运行时设计来解决这一问题。
+
+创建一个合适的运行时
+
+因此，如果我们可视化运行时不同部分之间的依赖程度，我们当前的设计可以这样描述：
+
+
+
+图 8.5 – 反应器与执行器之间的紧密耦合
+
+如果我们希望反应器与执行器之间实现松耦合，我们需要提供一个接口，以便在发生允许未来进展的事件时，通知执行器应当唤醒。这种类型在 Rust 标准库中被称为 Waker (https://doc.rust-lang.org/stable/std/task/struct.Waker.html)。如果我们改变我们的可视化以反映这一点，它将看起来像这样：
+
+
+
+图 8.6 – 一个松耦合的反应器和执行器
+
+我们采用与 Rust 现有设计相同的设计并非巧合。这是从 Rust 的角度来看一个最简设计，但它允许多种运行时设计，而不会对未来施加太多限制。
+
+注意
+尽管从语言的角度来看，今天的设计相当简约，但未来有计划稳定更多与异步相关的特性和接口。Rust 有一个工作组负责将广泛使用的特性和接口纳入标准库，您可以在这里找到更多信息： Rust Async Working Group。您还可以在这里获取他们正在处理的项目概览并跟踪进展：GitHub Projects。
+
+也许在阅读完这本书后，您甚至想要参与到让异步 Rust 更好的工作中（Getting Involved）？
+
+如果我们改变我们的系统图以反映未来对运行时所需的更改，它将看起来像这样：
+
+图 8.7 – 执行器和反应器：最终设计
+
+我们有两个部分，它们之间没有直接的依赖关系。我们有一个执行器（Executor），它调度任务并在轮询一个未来（future）时传递 Waker，最终将被反应器（Reactor）捕获并存储。当反应器收到事件已准备好的通知时，它会找到与该任务相关的 Waker 并调用 Wake::wake 方法。
+
+这使我们能够：
+
+运行多个操作系统线程，每个线程都有自己的执行器，但共享相同的反应器
+拥有多个反应器，以处理不同类型的叶子未来（leaf futures），并确保在可以进展时唤醒正确的执行器
+现在，我们有了实施的思路，是时候开始用代码编写它了。
+
+第一步 - 通过添加反应器和 Waker 来改善我们的运行时设计
+在这一步中，我们将进行以下更改：
+
+更改项目结构，以反映我们的新设计。
+找到一种方法，使执行器能够睡眠和唤醒，而不直接依赖于 Poll，并基于此创建一个 Waker，允许我们唤醒执行器并识别哪个任务可以继续。
+更改 Future 的特性定义，使 poll 方法接收一个 &Waker 作为参数。
+提示
+
+您将在 ch08/b-reactor-executor 文件夹中找到此示例。如果您通过编写书中的示例进行学习，建议您按照以下步骤创建一个名为 b-reactor-executor 的新项目：
+
+创建一个名为 b-reactor-executor 的新文件夹。
+进入新创建的文件夹并运行 cargo init。
+将前一个示例 a-runtime 中 src 文件夹中的所有内容复制到新项目的 src 文件夹中。
+将 Cargo.toml 文件中依赖部分的内容复制到新项目的 Cargo.toml 文件中。
+让我们开始对项目结构进行一些更改，以便为将来的构建奠定基础。我们要做的第一件事就是将我们的运行时模块分为两个子模块：反应器（reactor）和执行器（executor）。
+
+在 src 文件夹中创建一个名为 runtime 的新子文件夹。
+
+在 runtime 文件夹中创建两个新文件，分别命名为 reactor.rs 和 executor.rs。
+
+在 runtime.rs 中导入语句下方，声明这两个新模块，添加以下行：
+
+mod executor;
+mod reactor;
+现在，您的文件夹结构应该如下所示：
+
+src
+|-- runtime
+     |-- executor.rs
+     |-- reactor.rs
+|-- future.rs
+|-- http.rs
+|-- main.rs
+|-- runtime.rs
+为了完成设置，我们首先删除 runtime.rs 中的所有内容，并用以下代码替换：
+
+pub use executor::{spawn, Executor, Waker};
+pub use reactor::reactor;
+mod executor;
+mod reactor;
+
+pub fn init() -> Executor {
+    reactor::start();
+    Executor::new()
+}
+runtime.rs 的新内容首先声明了两个子模块，分别为 executor 和 reactor。然后，我们声明了一个名为 init 的函数，该函数启动我们的反应器并创建一个新的执行器，返回给调用者。
+
+下一步是找到一种方法，使我们的执行器在需要时能够睡眠和唤醒，而无需直接依赖 Poll。
+
+创建 Waker
+因此，我们需要找到一种使执行器睡眠并唤醒的不同方法，而不直接依赖于 Poll。事实证明，这非常简单。标准库为我们提供了运行所需的内容。通过调用 std::thread::current()，我们可以获取一个 Thread 对象。该对象是对当前线程的句柄，它使我们能够访问一些方法，其中之一是 unpark。
+
+标准库还为我们提供了一个方法，称为 std::thread::park()，它简单地请求操作系统调度器将我们的线程停放，直到我们要求它稍后被唤醒。事实证明，如果我们将这些结合起来，就有了一种能够停放和唤醒执行器的方法，这正是我们所需要的。
+
+让我们基于此创建一个 Waker 类型。在我们的示例中，我们将在 executor 模块内部定义 Waker，因为我们在此创建这种确切类型的 Waker，但是您也可以认为它属于 future 模块，因为它是 Future 特性的一部分。
+
+重要注意事项
+
+我们的 Waker 依赖于在标准库中的 Thread 类型上调用 park/unpark。对于我们的示例来说，这很好理解，但需要注意的是，代码的任何部分（包括您使用的任何库）都可以通过调用 std::thread::current() 获取对同一线程的句柄并调用 park/unpark，这不是一个稳健的解决方案。如果代码的无关部分在同一线程上调用 park/unpark，我们可能会错过唤醒，或者最终陷入死锁。大多数生产库会创建自己的 Parker 类型，或者依赖于类似于 crossbeam::sync::Parker 的实现。
+
+我们不会将 Waker 实现为一个特性，因为传递特性对象的复杂性显著增加，而且与当前 Rust 中 Future 和 Waker 的设计不符。
+
+打开位于 runtime 文件夹中的 executor.rs 文件，让我们从一开始就添加所有需要的导入：
+
+use crate::future::{Future, PollState};
+use std::{
+    cell::{Cell, RefCell},
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    thread::{self, Thread},
+};
+接下来，我们添加我们的 Waker：
+
+#[derive(Clone)]
+pub struct Waker {
+    thread: Thread,
+    id: usize,
+    ready_queue: Arc<Mutex<Vec<usize>>>,
+}
+Waker 将为我们保存三件事情：
+
+thread – 对我们之前提到的 Thread 对象的引用。
+id – 一个 usize，标识与此 Waker 相关联的任务。
+ready_queue – 这是一个可以在不同线程之间共享的引用，指向一个 Vec<usize>，其中 usize 表示在准备队列中的任务 ID。我们与执行器共享这个对象，以便在任务准备好时可以将与 Waker 相关联的任务 ID 推入队列中。
+我们 Waker 的实现将相当简单：
+
+impl Waker {
+    pub fn wake(&self) {
+        self.ready_queue
+            .lock()
+            .map(|mut q| q.push(self.id))
+            .unwrap();
+        self.thread.unpark();
+    }
+}
+当调用 Waker::wake 时，我们首先对保护我们与执行器共享的准备队列的 Mutex 进行加锁。然后我们将标识与此 Waker 相关联的任务的 id 值推入准备队列。
+
+完成后，我们在执行器线程上调用 unpark 以唤醒它。现在，它将在准备队列中找到与此 Waker 相关联的任务并调用其 poll 方法。
+
+值得一提的是，许多设计会接受对未来/任务本身的共享引用（例如，Arc<...>），并将其推入队列。通过这样做，他们跳过了通过将任务表示为 usize 而不是传递引用而带来的间接层。
+
+但是，我个人认为这种方式更容易理解和推理，最终结果将是相同的。
+
+这个 Waker 与标准库中的 Waker 有何比较？
+我们在这里创建的 Waker 在角色上与标准库中的 Waker 类型相同。最大的区别在于 std::task::Waker 方法被封装在一个 Context 结构中，并且在我们自己创建时需要经历一些额外的步骤。请不要担心 – 我们将在本书的最后进行所有这些，但这些区别对于理解它所扮演的角色并不重要，因此目前我们还是坚持使用自己简化的异步 Rust 版本。
+
+最后，我们需要做的是更改 Future 特性的定义，使其接受 &Waker 作为参数。
+
+
+更改 Future 定义
+由于我们的 Future 定义位于 future.rs 文件中，我们首先打开该文件。我们需要更改的第一件事是引入 Waker，以便我们可以使用它。在文件的顶部，添加以下代码：
+
+use crate::runtime::Waker;
+接下来，我们将更改我们的 Future 特性，使其接受 &Waker 作为参数：
+
+pub trait Future {
+    type Output;
+    fn poll(&mut self, waker: &Waker) -> PollState<Self::Output>;
+}
+在这一点上，你有一个选择。我们不会在接下来的内容中使用 join_all 函数或 JoinAll<F: Future> 结构。如果你不想保留它们，可以删除与 join_all 相关的所有内容，这就是你在 future.rs 中需要做的全部。如果你想保留它们以进行进一步实验，需要更改 JoinAll 的 Future 实现，以接受 waker: &Waker 参数，并记得在对连接的 futures 调用 poll 时传入 Waker：
+
+match fut.poll(waker)
+第 1 步的剩余工作是对我们实现 Future 特性的地方进行一些小更改。让我们从 http.rs 开始。我们首先轻微调整我们的依赖项，以反映对运行时模块所做的更改，并添加对新 Waker 的依赖。在文件顶部替换依赖部分为：
+
+use crate::{future::PollState, runtime::{self, reactor, Waker}, Future};
+use mio::Interest;
+use std::io::{ErrorKind, Read, Write};
+编译器会抱怨找不到反应器，但我们很快就会解决这个问题。接下来，我们必须导航到 impl Future for HttpGetFuture 块，在那里我们需要更改 poll 方法，以便它接受一个 &Waker 参数：
+
+impl Future for HttpGetFuture {
+    type Output = String;
+    fn poll(&mut self, waker: &Waker) -> PollState<Self::Output> {
+我们需要更改的最后一个文件是 main.rs。由于 corofy 不知道 Waker 类型，我们需要在 main.rs 的协程生成代码中更改几行。首先，我们必须添加对新 Waker 的依赖，因此在文件开头添加：
+
+use runtime::Waker;
+在 impl Future for Coroutine 块中，更改以下三行代码：
+
+fn poll(&mut self, waker: &Waker) 
+match f1.poll(waker) 
+match f2.poll(waker) 
+这就是我们在第 1 步中需要做的全部。我们会在最后一步时处理该文件中的错误，目前我们只专注于与 Waker 相关的所有内容。下一步将是创建一个适当的执行器。
+
+步骤 2 – 实现一个合适的执行器
+在这一步中，我们将创建一个执行器，它将：
+
+持有多个顶层的 futures 并在它们之间切换
+允许我们在异步程序的任何地方生成新的顶层 futures
+发放 Waker 类型，以便当没有任务时它们可以休眠，并在某个顶层 future 可以进展时唤醒
+允许我们运行多个执行器，每个执行器在其专用的操作系统线程上运行
+注意： 值得一提的是，我们的执行器不会完全支持多线程，因为任务/futures 不能从一个线程发送到另一个线程，并且不同的执行器实例彼此之间不会相互了解。因此，执行器不能偷取彼此的工作（不支持工作偷取），也不能依赖执行器从全局任务队列中选取任务。
+
+原因在于，如果我们朝这个方向发展，执行器设计将会变得更加复杂，不仅因为增加了逻辑，还因为我们必须添加一些限制，例如要求所有东西必须是 Send 和 Sync。
+
+当前异步 Rust 中的一些复杂性归因于 Rust 中许多运行时默认是多线程的，这使得异步 Rust 偏离“普通” Rust 远比实际需要的要多。值得一提的是，由于大多数生产运行时在 Rust 中默认是多线程的，它们中的大多数也都有一个工作偷取执行器。这将在第 1 章的最后一个 bartender 示例中类似于我们通过让 bartenders “偷取” 彼此正在进行的任务所实现的稍微提高效率。
+
+然而，这个例子仍然应该给你一个关于我们如何利用机器上的所有核心来运行异步任务的概念，尽管它的能力是有限的，这样我们能够获得并发性和并行性。
+
+让我们开始打开位于 runtime 子文件夹中的 executor.rs 文件。这个文件应该已经包含我们的 Waker 和我们需要的依赖项，因此我们可以在依赖项下面添加以下代码行。
+
+
+ch08/b-reactor-executor/src/runtime/executor.rs
+type Task = Box<dyn Future<Output = String>>;
+thread_local! {
+    static CURRENT_EXEC: ExecutorCore = ExecutorCore::default();
+}
+第一行是一个类型别名；它简单地让我们创建一个名为 Task 的别名，指向类型 Box<dyn Future<Output = String>>。这将有助于使我们的代码更简洁。
+
+下一行对一些读者来说可能是新鲜的。我们通过使用 thread_local! 宏定义了一个线程本地的静态变量。
+
+thread_local! 宏允许我们定义一个静态变量，该变量对它首次被调用的线程是独一无二的。这意味着我们创建的所有线程都将拥有自己的实例，并且一个线程无法访问另一个线程的 CURRENT_EXEC 变量。
+
+我们称该变量为 CURRENT_EXEC，因为它保存了当前在此线程上运行的执行器。
+
+接下来我们在这个文件中添加的行是对 ExecutorCore 的定义：
+
+#[derive(Default)]
+struct ExecutorCore {
+    tasks: RefCell<HashMap<usize, Task>>,
+    ready_queue: Arc<Mutex<Vec<usize>>>,
+    next_id: Cell<usize>,
+}
+ExecutorCore 持有我们执行器的所有状态：
+
+tasks – 这是一个以 usize 为键，以 Task（记住我们之前创建的别名）为数据的 HashMap。它将持有与该线程的执行器关联的所有顶层 futures，并允许我们为每个任务分配一个 id 属性以识别它们。我们不能简单地修改一个静态变量，因此我们在这里需要内部可变性。由于这将仅从一个线程调用，使用 RefCell 就足够了，因为不需要同步。
+
+ready_queue – 这是一个简单的 Vec<usize>，存储应由执行器轮询的任务 ID。如果我们参考图 8.7，你将看到它如何与我们在此处概述的设计相匹配。如前所述，我们可以在这里存储类似 Arc<dyn Future<...>> 的东西，但这会给我们的例子增加相当多的复杂性。目前设计的唯一缺点是，我们必须在我们的任务集合中查找任务，而不是直接获取对任务的引用，这需要时间。该集合的 Arc<...>（共享引用）将被分配给此执行器创建的每个 Waker。由于 Waker 可以（并且将）被发送到不同的线程，并通过将任务的 ID 添加到 ready_queue 来发出特定任务已准备好的信号，我们需要将其包装在 Arc<Mutex<...>> 中。
+
+next_id – 这是一个计数器，用于提供下一个可用的 ID，这意味着它不应该为该执行器实例两次发放相同的 ID。我们将使用它为每个顶层 future 分配一个唯一的 ID。由于执行器实例只能在创建它的同一线程上访问，因此一个简单的 Cell 就足够满足我们需要的内部可变性。
+
+ExecutorCore 扩展了 Default 特性，因为我们在这里不需要特殊的初始状态，它使代码保持简短而简洁。
+
+下一个函数是一个重要的函数。spawn 函数允许我们从程序中的任何地方向执行器注册新的顶层 futures。
+
+ch08/b-reactor-executor/src/runtime/executor.rs
+pub fn spawn<F>(future: F)
+where
+    F: Future<Output = String> + 'static,
+{
+    CURRENT_EXEC.with(|e| {
+        let id = e.next_id.get();
+        e.tasks.borrow_mut().insert(id, Box::new(future));
+        e.ready_queue.lock().map(|mut q| q.push(id)).unwrap();
+        e.next_id.set(id + 1);
+    });
+}
+spawn 函数完成了几件事情：
+
+它获取下一个可用的 ID。
+它将 ID 分配给接收到的 future，并将其存储在 HashMap 中。
+它将代表这一任务的 ID 添加到 ready_queue，以确保它至少被轮询一次（请记住，Rust 中的 Future traits 如果没有被轮询至少一次，就不会执行任何操作）。
+它将 ID 计数器增加 1。
+通过调用 with 并传入一个闭包来访问 CURRENT_EXEC 的不熟悉语法，实际上只是 Rust 中线程本地静态变量实现的结果。你还会注意到，由于我们对 tasks 和 next_id 使用了 RefCell 和 Cell 进行内部可变性，所以我们必须使用一些特殊的方法，但这些其实并没有本质上的复杂性，只是显得有些不熟悉。
+
+关于静态生命周期的快速说明
+当在此处作为特征约束使用 'static 生命周期时，它并不意味着我们传入的 Future trait 的生命周期必须是静态的（也就是说，它必须存在到程序结束）。这意味着它必须能够持续到程序结束，换句话说，生命周期不能以任何方式受到限制。
+
+大多数情况下，当你遇到需要 'static 约束的情况时，这仅仅意味着你需要将传入参数的所有权转移。如果你传入任何引用，它们需要具有 'static 生命周期。满足这一约束并不像你想象的那么困难。
+
+步骤 2 的最后部分是定义并实现 Executor 结构本身。Executor 结构非常简单，只需要添加一行代码：
+
+pub struct Executor;
+由于我们示例所需的所有状态都存储在 ExecutorCore 中，它是一个静态线程局部变量，因此我们的 Executor 结构不需要任何状态。这也意味着我们并不严格需要结构体，但为了保持 API 的某种熟悉度，我们还是这样做了。
+
+执行器的实现大部分是一些简单的辅助方法，它们最终出现在一个 block_on 函数中，那里真正发生了有趣的部分。由于这些辅助方法短且易于理解，我将在这里全部呈现并简要介绍它们的功能。
+
+
+
+注意
+我们在这里打开 impl Executor 块，但在实现 block_on 函数之前不会关闭它。
+
+impl Executor {
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    fn pop_ready(&self) -> Option<usize> {
+        CURRENT_EXEC.with(|q| q.ready_queue.lock().map(|mut q| q.pop()).unwrap())
+    }
+
+    fn get_future(&self, id: usize) -> Option<Task> {
+        CURRENT_EXEC.with(|q| q.tasks.borrow_mut().remove(&id))
+    }
+
+    fn get_waker(&self, id: usize) -> Waker {
+        Waker {
+            id,
+            thread: thread::current(),
+            ready_queue: CURRENT_EXEC.with(|q| q.ready_queue.clone()),
+        }
+    }
+
+    fn insert_task(&self, id: usize, task: Task) {
+        CURRENT_EXEC.with(|q| q.tasks.borrow_mut().insert(id, task));
+    }
+
+    fn task_count(&self) -> usize {
+        CURRENT_EXEC.with(|q| q.tasks.borrow().len())
+    }
+}
+所以，我们在这里有六个方法：
+
+new – 创建一个新的 Executor 实例。为了简化，我们在这里没有进行任何初始化，所有操作都是通过 thread_local! 宏延迟执行的。
+
+pop_ready – 此函数对 read_queue 加锁，并从 Vec 的末尾弹出一个已准备好的 ID。从后面调用 pop 意味着我们也将该项从集合中移除。作为旁注，由于 Waker 将其 ID 推送到 ready_queue 的末尾，而我们也是从末尾弹出，因此我们实际上得到了一个后进先出（LIFO）的队列。如果希望更改这一行为，使用标准库中的 VecDeque 就可以轻松选择我们从队列中移除项的顺序。
+
+get_future – 此函数接受一个顶层 future 的 ID 作为参数，从 tasks 集合中移除该 future，并返回它（如果找到该任务）。这意味着如果任务返回 NotReady（表示我们还未完成），我们需要记住再次将其添加回集合。
+
+get_waker – 此函数创建一个新的 Waker 实例。
+
+insert_task – 此函数接受一个 id 属性和一个 Task 属性，并将它们插入到我们的 tasks 集合中。
+
+task_count – 此函数简单地返回我们队列中任务的数量。
+
+执行器实现的最后一部分是 block_on 函数。这也是我们关闭 impl Executor 块的地方。
+
+
+block_on 函数
+pub fn block_on<F>(&mut self, future: F)
+where
+    F: Future<Output = String> + 'static,
+{
+    spawn(future);
+    loop {
+        while let Some(id) = self.pop_ready() {
+            let mut future = match self.get_future(id) {
+                Some(f) => f,
+                // 防止错误唤醒
+                None => continue,
+            };
+            let waker = self.get_waker(id);
+            match future.poll(&waker) {
+                PollState::NotReady => self.insert_task(id, future),
+                PollState::Ready(_) => continue,
+            }
+        }
+        let task_count = self.task_count();
+        let name = thread::current().name().unwrap_or_default().to_string();
+        if task_count > 0 {
+            println!("{name}: {task_count} pending tasks. Sleep until notified.");
+            thread::park();
+        } else {
+            println!("{name}: All tasks are finished");
+            break;
+        }
+    }
+}
+block_on 将是我们 Executor 的入口点。通常，你会首先传入一个顶层的 future，当顶层的 future 进展时，它将生成新的顶层 futures。每个新的 future 当然也可以将新的 futures 生成到 Executor 中，这就是异步程序的基本工作方式。
+
+在许多方面，你可以将这个第一个顶层 future 视为在常规 Rust 程序中查看 main 函数的方式。spawn 类似于 thread::spawn，但在这个示例中，任务保持在同一个操作系统线程上。这意味着任务无法并行运行，从而使我们避免任何对任务之间的数据竞争的同步需求。
+
+让我们逐步分析这个函数：
+
+我们首先做的是将我们接收到的 future 始发到自身上。有许多方法可以实现这一点，但这是最简单的方法。
+
+然后，我们有一个循环，它将持续运行，直到我们的异步程序结束。
+
+每次循环时，我们会创建一个内部的 while let Some(...) 循环，只要 ready_queue 中还有任务就会运行。
+
+如果 ready_queue 中有任务，我们通过从集合中移除它来获取 Future 对象的所有权。我们通过仅在没有 Future 时继续执行来防止错误唤醒（这意味着我们已经完成了它，但仍然收到了唤醒）。例如，这种情况会发生在 Windows 上，因为当连接关闭时，我们会收到一个可读事件，但是尽管我们可以过滤掉这些事件，mio 并不保证不会发生错误唤醒，所以我们无论如何都必须处理这种可能性。
+
+接下来，我们创建一个新的 Waker 实例，可以将其传递给 Future::poll()。记住，这个 Waker 实例现在持有标识这个特定 Future 特征的 id 属性以及我们当前运行的线程的句柄。
+
+下一步是调用 Future::poll。
+
+如果返回的是 NotReady，我们将任务再次插入我们的任务集合中。我想强调的是，当 Future 特征返回 NotReady 时，我们知道它会安排在稍后的某个时刻调用 Waker::wake。跟踪该 future 的就绪状态并不是执行者的责任。
+
+如果 Future 特征返回 Ready，我们就简单地继续到就绪队列中的下一个项目。由于我们已获得 Future 特征的所有权，因此在进入 while let 循环的下一次迭代之前，这将释放该对象。
+
+现在我们已经轮询了就绪队列中的所有任务，首先做的是获取任务计数，以查看我们还剩下多少任务。
+
+我们还获取当前线程的名称，以备将来记录使用（这与我们的执行者如何工作无关）。
+
+如果任务计数大于 0，我们会在终端打印一条消息并调用 thread::park()。停车线程将控制权让给操作系统调度器，我们的执行者将不会执行任何操作，直至再次被唤醒。
+
+如果任务计数为 0，我们就完成了我们的异步程序并退出主循环。
+
+这就是全部内容。到这一步为止，我们已经完成了步骤 2 的所有目标，因此可以继续进行最后一步，实施一个反应器，以在发生某些事情时唤醒我们的执行者。
+
+第 3 步 – 实施一个适当的反应器
+我们示例的最后部分是反应器。我们的反应器将：
+
+高效地等待并处理我们的运行时所关注的事件。
+存储 Waker 类型的集合，并确保在收到它正在跟踪的源的通知时唤醒正确的 Waker。
+为地叶 futures（如 HttpGetFuture）提供注册和注销事件的兴趣所需的机制。
+提供一种方法，让地叶 futures 存储最后接收到的 Waker。
+完成这一步后，我们就应该具备运行时所需的一切，所以让我们开始吧。
+
+首先打开 reactor.rs 文件。我们首先添加所需的依赖：
+
+use crate::runtime::Waker;
+use mio::{net::TcpStream, Events, Interest, Poll, Registry, Token};
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex, OnceLock,
+    },
+    thread,
+};
+添加依赖后，我们创建一个类型别名，称为 Wakers，作为我们的 wakers 集合的别名：
+
+type Wakers = Arc<Mutex<HashMap<usize, Waker>>>;
+下一行将声明一个静态变量，称为 REACTOR：
+
+static REACTOR: OnceLock<Reactor> = OnceLock::new();
+该变量将保持一个 OnceLock<Reactor>。与我们的 CURRENT_EXEC 静态变量不同，将可以从不同线程访问这个变量。OnceLock 允许我们定义一个只能初始化一次的静态变量，以便在启动反应器时初始化它。通过这样做，我们还确保该特定反应器在程序中只能运行一个实例。
+
+
+
+该变量将对这个模块私有，因此我们创建一个公共函数，允许程序的其他部分访问它：
+
+pub fn reactor() -> &'static Reactor {
+    REACTOR.get().expect("在运行时上下文外调用")
+}
+接下来，我们定义我们的 Reactor 结构体：
+
+pub struct Reactor {
+    wakers: Wakers,
+    registry: Registry,
+    next_id: AtomicUsize,
+}
+这将是 Reactor 结构体需要持有的所有状态：
+
+wakers – 一个包含 Waker 对象的 HashMap，每个 Waker 由一个整数标识。
+registry – 保存一个 Registry 实例，以便我们可以与 mio 中的事件队列进行交互。
+next_id – 存储下一个可用的 ID，以便我们可以跟踪发生了哪个事件以及哪个 Waker 应该被唤醒。
+Reactor 的实现实际上非常简单。它只有四个简短的方法用于与 Reactor 实例进行交互，因此我将它们全部列出，并稍后进行简要解释：
+
+impl Reactor {
+    pub fn register(&self, stream: &mut TcpStream, interest: Interest, id: usize) {
+        self.registry.register(stream, Token(id), interest).unwrap();
+    }
+
+    pub fn set_waker(&self, waker: &Waker, id: usize) {
+        let _ = self
+            .wakers
+            .lock()
+            .map(|mut w| w.insert(id, waker.clone()).is_none())
+            .unwrap();
+    }
+
+    pub fn deregister(&self, stream: &mut TcpStream, id: usize) {
+        self.wakers.lock().map(|mut w| w.remove(&id)).unwrap();
+        self.registry.deregister(stream).unwrap();
+    }
+
+    pub fn next_id(&self) -> usize {
+        self.next_id.fetch_add(1, Ordering::Relaxed)
+    }
+}
+让我们简要解释一下这四个方法的功能：
+
+register - 此方法是对 Registry::register 的一个轻量级封装，我们在第四章中了解到这个方法。需要注意的一点是，我们传入一个 id 属性，以便在稍后收到通知时能够识别发生了哪个事件。
+
+set_waker - 此方法用于将 Waker 关联到特定的 id，以便在事件发生后唤醒相应的任务。
+
+deregister - 这个方法用于从 wakers 中移除特定的 id 并注销流，以确保不再处理该流的事件。
+
+next_id - 此方法生成一个新的 ID，以便在事件发生时能分配一个唯一的标识符。
+
+register – 此方法是对 Registry::register 的一个薄包装，这是我们在第四章中了解到的。需要注意的一点是，我们传入一个 id 属性，以便在稍后收到通知时能够识别哪个事件已经发生。
+
+set_waker – 此方法使用提供的 id 属性作为键，将一个 Waker 添加到我们的 HashMap 中进行识别。如果那里已经存在一个 Waker，我们会替换它并丢弃旧的。一个重要的要点是，我们应该始终存储最新的 Waker，因此这个函数可以多次调用，即使已经与 TcpStream 关联了一个 Waker。
+
+deregister – 这个函数有两个作用。首先，它从我们的 wakers 集合中移除 Waker。然后，它从我们的 Poll 实例中注销 TcpStream。在这里我要提醒您，尽管在我们的示例中我们只处理 TcpStream，但理论上，这可以用于任何实现了 mio 的 Source trait 的事物，因此相同的思维过程在比我们这里处理的范围更广泛的上下文中也是有效的。
+
+next_id – 这个方法简单地获取当前的 next_id 值并原子性地递增计数器。我们不关心这里发生的任何先后关系；我们只关心不分配相同的值两次，所以 Ordering::Relaxed 在这里就足够了。原子操作中的内存顺序是一个复杂的话题，我们在本书中无法深入探讨，但如果您想了解更多关于 Rust 中不同内存顺序及其含义的内容，官方文档是一个很好的入门来源：Rust 官方文档。
+
+fn event_loop(mut poll: Poll, wakers: Wakers) {
+    let mut events = Events::with_capacity(100);
+    loop {
+        poll.poll(&mut events, None).unwrap();
+        for e in events.iter() {
+            let Token(id) = e.token();
+            let wakers = wakers.lock().unwrap();
+            if let Some(waker) = wakers.get(&id) {
+                waker.wake();
+            }
+        }
+    }
+}
+这个函数接受一个 Poll 实例和一个 Wakers 集合作为参数。让我们逐步分析一下：
+
+首先，我们创建一个事件集合。这在第四章时我们做过同样的事情。
+
+接下来，我们创建一个循环，在我们的案例中，它将无限循环。这使得我们的示例简短易懂，但缺点是，一旦开始后，我们没有办法关闭这个事件循环。解决这一点并特别困难，但鉴于我们示例中不需要，我们在这里不作讨论。
+
+在循环内部，我们调用 Poll::poll，并设置超时为 None，这意味着它永远不会超时，并将阻塞直到收到事件通知。
+
+当调用返回时，我们遍历每一个接收到的事件。
+
+如果我们接收到一个事件，这意味着我们注册的兴趣发生了变化，因此我们获取在首次注册该 TcpStream 的事件时传入的 id。
+
+最后，我们尝试获取相关的 Waker，并调用 Waker::wake。我们会防范 Waker 可能已经从我们的集合中移除的情况；在这种情况下，我们什么也不做。
+
+值得注意的是，如果我们想，我们可以在这里过滤事件。Tokio 在 Event 对象上提供了一些方法，以检查报告的事件的几项内容。对于我们示例中的用法，我们不需要过滤事件。
+
+最后，第二个公共函数是初始化并启动运行时的函数：
+
+pub fn start() {
+    use thread::spawn;
+    let wakers = Arc::new(Mutex::new(HashMap::new()));
+    let poll = Poll::new().unwrap();
+    let registry = poll.registry().try_clone().unwrap();
+    let next_id = AtomicUsize::new(1);
+    let reactor = Reactor {
+        wakers: wakers.clone(),
+        registry,
+        next_id,
+    };
+    REACTOR.set(reactor).ok().expect("Reactor already running");
+    spawn(move || event_loop(poll, wakers));
+}
+start 方法应该比较容易理解。我们首先创建 Wakers 集合和 Poll 实例。通过 Poll 实例，我们获得 Registry 的一个拥有版本。我们将 next_id 初始化为1（出于调试目的，我想将其初始化为不同于我们的 Executor 的起始值），然后创建我们的 Reactor 对象。
+
+接着，我们通过提供 Reactor 实例设置我们命名为 REACTOR 的静态变量。
+
+最后，关注的重点是我们生成一个新的操作系统线程，并在该线程上启动 event_loop 函数。这也意味着我们将 Poll 实例传递给事件循环线程。
+
+现在，最佳实践是存储 spawn 返回的 JoinHandle，以便稍后可以连接这个线程，但我们的线程无论如何无法关闭事件循环，因此稍后连接它没有太大意义，我们就简单地丢弃该句柄。
+
+我不知道你是否同意我的看法，但当我们将其分解成较小的部分时，这里的逻辑并不复杂。由于我们已经知道 epoll 和 mio 的工作原理，剩下的内容相对容易理解。
+
+现在，我们还没有完成。我们还需要对 HttpGetFuture 叶子未来进行一些小修改，因为它目前未能与反应器注册。让我们解决这个问题。
+
+首先打开 http.rs 文件。由于我们在打开文件时已经添加了正确的导入，以将所有内容适配到新的 Future 接口，因此我们只需要更改几个地方，使这个叶子 Future 与我们的反应器很好地集成。
+
+我们首先要给 HttpGetFuture 一个身份。它是我们希望通过反应器跟踪的事件源，因此我们希望它在完成之前保持相同的 ID：
+
+struct HttpGetFuture {
+    stream: Option<mio::net::TcpStream>,
+    buffer: Vec<u8>,
+    path: String,
+    id: usize,
+}
+我们还需要在创建 Future 时从反应器中获取新的 ID：
+
+impl HttpGetFuture {
+    fn new(path: String) -> Self {
+        let id = reactor().next_id();
+        Self {
+            stream: None,
+            buffer: vec![],
+            path,
+            id,
+        }
+    }
+}
+接下来，我们必须找到 HttpGetFuture 的 poll 实现。我们需要做的第一件事是确保我们向 Poll 实例注册兴趣，并在 Future 第一次被 poll 时与反应器注册我们接收到的 Waker。由于我们不再直接与 Registry 注册，因此我们删除那行代码，而是添加以下新行：
+
+
+如果 self.stream.is_none() {
+println!(“第一次 polling - 开始操作”);
+self.write_request();
+let stream = self.stream.as_mut().unwrap();
+runtime::reactor().register(stream, Interest::READABLE, self.id);
+runtime::reactor().set_waker(waker, self.id);
+}
+
+最后，我们需要对从 TcpStream 读取时处理不同条件的方式进行一些小改动：
+
+match self.stream.as_mut().unwrap().read(&mut buff) {
+    Ok(0) => {
+        let s = String::from_utf8_lossy(&self.buffer);
+        runtime::reactor().deregister(self.stream.as_mut().unwrap(), self.id);
+        break PollState::Ready(s.to_string());
+    }
+    Ok(n) => {
+        self.buffer.extend(&buff[0..n]);
+        continue;
+    }
+    Err(e) if e.kind() == ErrorKind::WouldBlock => {
+        runtime::reactor().set_waker(waker, self.id);
+        break PollState::NotReady;
+    }
+    Err(e) => panic!("{e:?}"),
+}
+第一个改动是在完成时从我们的 Poll 实例注销流。
+第二个改动则稍微微妙一些。如果仔细阅读 Rust 中 Future::poll 的文档（链接），你会发现期望最近一次调用的 Waker 应该被调度为唤醒。这意味着每次我们遇到 WouldBlock 错误时，需要确保存储最近的 Waker。
+
+原因是，未来可能在调用之间转移到不同的执行器，我们需要唤醒正确的一个（虽然在我们的例子中不可能移动未来，但我们还是遵循相同的规则）。
+
+就这样！
+恭喜你！你现在已创建了一个基于 reactor-executor 模式的完全可工作运行时。
+干得好！
+现在，是时候进行测试并进行几个实验了。
+让我们回到 main.rs 并更改主函数，以便我们正确运行新运行时的程序。
+首先，让我们移除对 Runtime 结构的依赖，并确保我们的导入看起来像这样
+
+
+ch08/b-reactor-executor/src/main.rs
+mod future;
+mod http;
+mod runtime;
+use future::{Future, PollState};
+use runtime::Waker;
+接下来，我们需要确保初始化我们的运行时并将我们的未来传递给 executor.block_on。我们的主函数应该看起来像这样：
+
+ch08/b-reactor-executor/src/main.rs
+fn main() {
+    let mut executor = runtime::init();
+    executor.block_on(async_main());
+}
+最后，让我们通过运行它来试一试：
+
+cargo run
+你应该看到以下输出：
+
+程序启动
+第一次 polling - 开始操作
+main: 1 个待处理任务。睡眠，直到收到通知。
+HTTP/1.1 200 OK
+content-length: 15
+connection: close
+content-type: text/plain; charset=utf-8
+date: Thu, xx xxx xxxx 15:38:08 GMT
+HelloAsyncAwait
+第一次 polling - 开始操作
+main: 1 个待处理任务。睡眠，直到收到通知。
+HTTP/1.1 200 OK
+content-length: 15
+connection: close
+content-type: text/plain; charset=utf-8
+date: Thu, xx xxx xxxx 15:38:08 GMT
+HelloAsyncAwait
+main: 所有任务完成
+太好了——它的工作就如预期的一样！！！
+
+然而，我们实际上还没有真正利用我们运行时的新功能。因此，在我们离开这一章之前，让我们玩得开心，看看它能做些什么。
+
+实验我们新的运行时
+
+如果你还记得第七章，我们实现了一个 join_all 方法来让我们的未来并发运行。在像 Tokio 这样的库中，你也会发现一个 join_all 函数，以及略微更通用的 FuturesUnordered API，允许你加入一组预定义的未来并同时运行它们。这些方法很方便，但它确实要求你提前知道想要并发运行哪些未来。如果你使用 join_all 运行的未来想要生成新的未来，以便与其“父”未来并发运行，仅使用这些方法是无法做到的。
+
+然而，我们新创建的 spawn 功能正是为此而设计。让我们来进行测试！
+
+使用并发的示例
+
+注意
+这个程序的完全相同版本可以在 ch08/c-runtime-executor 文件夹中找到。
+
+让我们尝试一个新的程序，代码如下：
+
+fn main() {
+    let mut executor = runtime::init();
+    executor.block_on(async_main());
+}
+
+coro fn request(i: usize) {
+    let path = format!("/{}/HelloWorld{i}", i * 1000);
+    let txt = Http::get(&path).wait;
+    println!("{txt}");
+}
+
+coro fn async_main() {
+    println!("程序启动");
+    for i in 0..5 {
+        let future = request(i);
+        runtime::spawn(future);
+    }
+}
+这基本上是我们在第七章中用来展示 join_all 如何工作的同一个示例，只不过这次我们将其作为顶级未来生成。
+
+要运行这个示例，请按照以下步骤操作：
+
+将 main.rs 中的所有内容替换为上面的代码，保留导入部分不变。
+运行 corofy ./src/main.rs。
+将 main_corofied.rs 中的所有内容复制到 main.rs，然后删除 main_corofied.rs。
+修复 corofy 不知道我们将未来改为接受 waker: &Waker 作为参数的问题。最简单的方法是运行 cargo check，让编译器指导你需要更改的地方。
+现在，你可以运行这个示例，看到任务并发运行，就像在第七章中使用 join_all 时一样。如果你测量运行这些任务所需的时间，你会发现总共大约需要4秒，这很合理，因为你刚刚生成了5个未来并并发运行。单个未来的最长等待时间是4秒。
+
+现在，让我们用另一个有趣的示例来结束这章内容。
+
+并发和并行运行多个未来
+
+这次，我们将生成多个线程，并给每个线程一个自己的执行器，以便我们可以在所有执行器实例中同时并行运行之前的示例。我们还会对输出做一个小调整，以免数据过于庞大而让我们感到不堪重负。
+
+
+我们的新程序将如下所示：
+
+mod future;
+mod http;
+mod runtime;
+
+use crate::http::Http;
+use future::{Future, PollState};
+use runtime::{Executor, Waker};
+use std::thread::Builder;
+
+fn main() {
+    let mut executor = runtime::init();
+    let mut handles = vec![];
+    for i in 1..12 {
+        let name = format!("exec-{i}");
+        let h = Builder::new().name(name).spawn(move || {
+            let mut executor = Executor::new();
+            executor.block_on(async_main());
+        }).unwrap();
+        handles.push(h);
+    }
+    executor.block_on(async_main());
+    handles.into_iter().for_each(|h| h.join().unwrap());
+}
+
+coroutine fn request(i: usize) {
+    let path = format!("/{}/HelloWorld{i}", i * 1000);
+    let txt = Http::get(&path).wait;
+    let txt = txt.lines().last().unwrap_or_default();
+    println!("{txt}");
+}
+
+coroutine fn async_main() {
+    println!("程序启动");
+    for i in 0..5 {
+        let future = request(i);
+        runtime::spawn(future);
+    }
+}
+我目前运行的机器有12个核心，所以当我创建11个新线程来运行相同的异步任务时，我会使用我机器上的所有核心。正如你所注意到的，我们还为每个线程提供了一个唯一的名称，方便我们在日志中使用，以更容易地追踪幕后发生的事情。
+
+注意
+虽然我使用12个核心，但你应该使用你机器上的核心数量。如果我们将这个数字增加得太多，我们的操作系统将无法为我们提供更多的核心并在并行中运行我们的程序，而是开始暂停/恢复我们创建的线程，这对我们没有任何价值，因为我们在异步运行时自己处理并发方面。
+
+你将需要做与我们在上一个示例中相同的步骤：
+
+将 main.rs 中当前的代码替换为上面的代码。
+运行 corofy ./src/main.rs。
+将 main_corofied.rs 中的所有内容复制到 main.rs 中，然后删除 main_corofied.rs。
+修复 corofy 不知道我们将 futures 改为接受 waker: &Waker 作为参数的问题。最简单的方法就是运行 cargo check，让编译器指导你需要更改的地方。
+现在，如果你运行这个程序，你会发现它仍然只需要大约4秒来运行，但这次我们进行了60个 GET 请求，而不是5个。这一次，我们的 futures 同时并行运行。
+
+在这个时候，你可以继续尝试更短的延迟或更多请求，看看在系统崩溃之前你可以同时处理多少任务。
+
+打印到标准输出会很快成为瓶颈，但你可以禁用这些功能。创建一个使用操作系统线程的阻塞版本，看看你可以并行运行多少线程，而不会让系统崩溃，和这个版本相比。
+
+只有想象力设置了限制，但在我们继续下一个章节之前，请花些时间享受你所创建的内容。
+
+唯一需要注意的是，不要向你自己无法控制的随机服务器发送这种请求来测试你系统的并发限制，因为这可能会导致其 overload 而给他人造成问题。
+
+总结
+哇，这真是一次惊险之旅！正如我在本章的介绍中所说，这是本书中最重要的章节之一，但即使你可能没有意识到，你对异步 Rust 的理解比大多数人都要好。干得好！
+
+在这一章中，你学到了很多关于运行时的信息，以及为什么 Rust 按照那样的方式设计 Future trait 和 Waker。你还了解了反应器和执行器、Waker 类型、Futures trait，以及通过 join_all 函数和在执行器上生成新的顶级 futures 实现并发的不同方式。
+
+到现在为止，你也知道通过将我们自己的运行时与操作系统线程结合起来，我们如何同时实现并发和并行。
+
+现在，我们已经创建了自己的异步宇宙，包含 coro/wait、我们自己的 Future trait、我们自己的 Waker 定义和我们自己的运行时。我确保我们没有偏离 Rust 中异步编程的核心思想，以便一切都可以直接应用于异步/等待、Future trait、Waker 类型和日常编程中的运行时。
+
+到现在为止，我们已经接近本书的最后阶段。最后一章将最终将我们的示例转换为使用真实的 Future trait、Waker、async/await 等，而不是我们自己的版本。在那一章中，我们还将留出一些空间来讨论当前异步 Rust 的状态，包括一些最流行的运行时，但在我们走到那一步之前，还有一个主题我想讨论：pinning（固定）。
+
+固定的概念似乎是最难理解的主题之一，与其他任何语言都大相径庭。当写异步 Rust 时，你在某个时刻必须处理 Future traits 在被轮询之前必须被固定的事实。
+
+因此，下一章将以实用的方式解释 Rust 中的固定，以便你理解我们为什么需要它，它的作用是什么，以及如何做到这一点。
+
+不过，在这一章结束后你绝对值得休息一下，所以去透透气，睡一觉，清空你的思绪，喝杯咖啡，然后再进入本书的最后部分。
 
 
